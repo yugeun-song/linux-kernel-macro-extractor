@@ -1,0 +1,40 @@
+[package]
+name = "kmx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Config-aware Linux kernel macro explorer: every candidate definition, why one wins, and the full expansion trace"
+license = "0BSD"
+repository = "https://github.com/yugeun-song/linux-kernel-macro-extractor"
+readme = "README.md"
+keywords = ["linux", "kernel", "preprocessor", "macro", "kconfig"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+fst = "0.4.7"
+globset = "0.4.20"
+libc = "0.2.190"
+memchr = "2.8.3"
+memmap2 = "0.9.11"
+rayon = "1.12.0"
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-perl"] }
+rustc-hash = "2.1.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+shlex = "2.0.1"
+thiserror = "2.0.21"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = false
+strip = true
+
+[profile.dev]
+opt-level = 1
