@@ -840,6 +840,10 @@ fn basic_type(toks: &[T<'_>]) -> bool {
             .any(|t| t.word() && !QUALIFIERS.contains(&t.text))
 }
 
+fn same_type(a: &[T<'_>], b: &[T<'_>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.text == y.text)
+}
+
 fn unevaluated_size(raw: &[T<'_>]) -> bool {
     let [word, open, content @ .., close] = raw else {
         return false;
@@ -956,7 +960,14 @@ fn fold(e: E<'_>) -> Folded<'_> {
             settle(E::Binary(op, p, Box::new(l.e), Box::new(r.e)), k, true)
         }
         E::Cast(ty, x) => {
-            let x = fold(*x);
+            let mut x = fold(*x);
+            if let E::Cast(inner, operand) = x.e {
+                x.e = if basic_type(ty) && same_type(ty, inner) {
+                    *operand
+                } else {
+                    E::Cast(inner, operand)
+                };
+            }
             let words: Option<Vec<&str>> = ty.iter().map(|t| t.word().then_some(t.text)).collect();
             let k = match (x.k, words) {
                 (Some(k), Some(w)) => c_const::cast(&w, k),
@@ -1311,6 +1322,39 @@ mod tests {
             ("(p ? (q ? 1 : 2) : 3)", &[], Some("p ? (q ? 1 : 2) : 3")),
             ("(p ? 1 : (q ? 2 : 3))", &[], Some("p ? 1 : q ? 2 : 3")),
             ("((x)) + 1", &[], Some("x + 1")),
+            (
+                "__virt_to_phys((unsigned long)((unsigned long)address))",
+                &["address"],
+                Some("__virt_to_phys((unsigned long)address)"),
+            ),
+            (
+                "(unsigned long)(unsigned long)(unsigned long)(x)",
+                &[],
+                Some("(unsigned long)x"),
+            ),
+            ("(unsigned long)(unsigned long)(x) - 1", &[], None),
+            (
+                "(unsigned long)(unsigned long)(x) - 1",
+                &["x"],
+                Some("(unsigned long)x - 1"),
+            ),
+            ("(int *)(int *)p", &[], Some("(int *)p")),
+            (
+                "(unsigned long)(unsigned long)1",
+                &[],
+                Some("(unsigned long)1"),
+            ),
+            (
+                "(long)(unsigned long)x",
+                &[],
+                Some("(long)(unsigned long)x"),
+            ),
+            ("(T)(T)x", &[], None),
+            (
+                "(typeof(x))(typeof(x))y",
+                &[],
+                Some("(typeof(x))(typeof(x))y"),
+            ),
         ];
         for (src, known, want) in cases {
             assert_eq!(run(src, known).as_deref(), *want, "{src} with {known:?}");

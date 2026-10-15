@@ -39,6 +39,12 @@ Results are cleaned up only by rewrites that hold for every C expression:
   hexadecimal operands is written in hexadecimal. Nothing is folded when the
   operation is undefined or implementation-defined, such as signed overflow, a
   shift by the width of the type, or a right shift of a negative value.
+- A cast repeated on its own result is written once:
+  `(unsigned long)(unsigned long)address` becomes `(unsigned long)address`, as
+  in riscv64's `virt_to_phys`, whose `__pa()` casts what it already cast.
+  Converting a value to the type it already has changes nothing. Only basic
+  types and pointers to them qualify: a typedef name could be a variable, and
+  `typeof` of a variably modified type evaluates its operand.
 - Statements without effect are removed from statement expressions: `(void)`
   applied to a constant or to a `sizeof` whose operand cannot be a variable
   length array, and empty statements. With `CONFIG_DEBUG_VM` off,
