@@ -1229,6 +1229,327 @@ fn int_type<'a>(e: &E<'a>, cx: &Cx<'_, 'a>) -> Option<IntTy> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chain {
+    And,
+    Or,
+    Xor,
+    Add,
+    Mul,
+}
+
+fn chain_of(op: &str) -> Option<Chain> {
+    Some(match op {
+        "&" => Chain::And,
+        "|" => Chain::Or,
+        "^" => Chain::Xor,
+        "+" | "-" => Chain::Add,
+        "*" => Chain::Mul,
+        _ => return None,
+    })
+}
+
+fn only_konsts<'a>(e: &E<'a>, c: Chain, cx: &Cx<'_, 'a>) -> bool {
+    match e {
+        E::Binary(op, _, l, r) if chain_of(op) == Some(c) => {
+            only_konsts(l, c, cx) && only_konsts(r, c, cx)
+        }
+        leaf => term_konst(leaf, cx).is_some(),
+    }
+}
+
+fn chain_terms<'e, 'a>(
+    e: &'e E<'a>,
+    c: Chain,
+    neg: bool,
+    whole: bool,
+    cx: &Cx<'_, 'a>,
+    out: &mut Vec<(bool, &'e E<'a>)>,
+) {
+    if let E::Binary(op, _, l, r) = e
+        && chain_of(op) == Some(c)
+        && !(matches!(c, Chain::Add | Chain::Mul) && only_konsts(e, c, cx))
+    {
+        chain_terms(l, c, neg, whole, cx, out);
+        let rneg = neg ^ (*op == "-");
+        if whole {
+            chain_terms(r, c, rneg, whole, cx, out);
+        } else {
+            out.push((rneg, r));
+        }
+        return;
+    }
+    out.push((neg, e));
+}
+
+fn term_konst<'a>(e: &E<'a>, cx: &Cx<'_, 'a>) -> Option<Konst> {
+    let k = match e {
+        E::Lit(t) => c_const::literal(t)?,
+        E::Prefix(op, x) => c_const::unary(op, term_konst(x, cx)?)?,
+        E::Cast(ty, x) => {
+            let k = term_konst(x, cx)?;
+            let words: Option<Vec<&str>> = ty.iter().map(|t| t.word().then_some(t.text)).collect();
+            let typed = |k: Konst| cast_type(ty, cx).and_then(|t| c_const::cast_to(t, k));
+            match words {
+                Some(w) => c_const::cast(&w, k).or_else(|| typed(k))?,
+                None => typed(k)?,
+            }
+        }
+        E::Atom(_) | E::Raw(_) | E::Size(..) => fold(clone_e(e), cx).k?,
+        E::Call(f, _) if matches!(&**f, E::Atom(n) if n.starts_with("__builtin_")) => {
+            fold(clone_e(e), cx).k?
+        }
+        _ => return None,
+    };
+    Some(Konst {
+        ty: promote(k.ty),
+        ..k
+    })
+}
+
+fn representable(v: i128, t: IntTy) -> bool {
+    c_const::cast_to(
+        t,
+        Konst {
+            v,
+            ty: t,
+            hex: false,
+        },
+    )
+    .is_some_and(|k| k.v == v)
+}
+
+fn merge_konsts(c: Chain, ks: &[(bool, Konst)], ty: IntTy, wraps: bool) -> Option<(bool, Konst)> {
+    let hex = matches!(c, Chain::And | Chain::Or | Chain::Xor) || ks.iter().any(|(_, k)| k.hex);
+    let vals: Vec<i128> = ks
+        .iter()
+        .map(|(_, k)| c_const::cast_to(ty, *k).map(|k| k.v))
+        .collect::<Option<_>>()?;
+    let modulus = 1i128 << ty.bits();
+    let unsigned = !ty.signed(false);
+    let konst = |v: i128| Konst { v, ty, hex };
+    match c {
+        Chain::And | Chain::Or | Chain::Xor => {
+            let v = vals[1..].iter().fold(vals[0], |acc, x| match c {
+                Chain::And => acc & x,
+                Chain::Or => acc | x,
+                _ => acc ^ x,
+            });
+            Some((false, konst(v)))
+        }
+        Chain::Add => {
+            let mut s = 0i128;
+            for ((neg, _), x) in ks.iter().zip(&vals) {
+                s = if *neg {
+                    s.checked_sub(*x)?
+                } else {
+                    s.checked_add(*x)?
+                };
+            }
+            if representable(s.abs(), ty) {
+                Some((s < 0, konst(s.abs())))
+            } else if wraps && unsigned {
+                let r = s.rem_euclid(modulus);
+                Some(if r > modulus / 2 {
+                    (true, konst(modulus - r))
+                } else {
+                    (false, konst(r))
+                })
+            } else {
+                None
+            }
+        }
+        Chain::Mul => {
+            let p = vals.iter().try_fold(1i128, |acc, x| acc.checked_mul(*x))?;
+            if representable(p, ty) {
+                Some((false, konst(p)))
+            } else if wraps && unsigned {
+                Some((false, konst(p.rem_euclid(modulus))))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn neutral(c: Chain, k: Konst) -> bool {
+    match c {
+        Chain::And => {
+            k.v == if k.ty.signed(false) {
+                -1
+            } else {
+                (1i128 << k.ty.bits()) - 1
+            }
+        }
+        Chain::Or | Chain::Xor | Chain::Add => k.v == 0,
+        Chain::Mul => k.v == 1,
+    }
+}
+
+fn konst_operand<'a>(k: Konst) -> Option<E<'a>> {
+    let (neg, text) = c_const::spell(k)?;
+    let lit = E::Lit(text);
+    Some(if neg {
+        E::Prefix("-", Box::new(lit))
+    } else {
+        lit
+    })
+}
+
+fn rebuild<'a>(c: Chain, op: &'a str, p: u8, parts: Vec<(bool, E<'a>)>) -> E<'a> {
+    let mut parts = parts.into_iter();
+    let (neg, first) = parts.next().expect("a chain keeps an operand");
+    let mut acc = if neg {
+        E::Prefix("-", Box::new(first))
+    } else {
+        first
+    };
+    for (neg, e) in parts {
+        let op = match c {
+            Chain::Add if neg => "-",
+            Chain::Add => "+",
+            _ => op,
+        };
+        acc = E::Binary(op, p, Box::new(acc), Box::new(e));
+    }
+    acc
+}
+
+type Term<'e, 'a> = (bool, &'e E<'a>, Option<Konst>, Option<IntTy>);
+
+fn analyze_terms<'e, 'a>(
+    e: &'e E<'a>,
+    c: Chain,
+    whole: bool,
+    cx: &Cx<'_, 'a>,
+) -> Vec<Term<'e, 'a>> {
+    let mut found = Vec::new();
+    chain_terms(e, c, false, whole, cx, &mut found);
+    found
+        .into_iter()
+        .map(|(neg, t)| {
+            let k = term_konst(t, cx);
+            let ty = k.map(|k| k.ty).or_else(|| int_type(t, cx).map(promote));
+            (neg, t, k, ty)
+        })
+        .collect()
+}
+
+fn gather_all<'a>(c: Chain, op: &'a str, p: u8, terms: &[Term<'_, 'a>]) -> Option<E<'a>> {
+    let konsts: Vec<(bool, Konst)> = terms.iter().filter_map(|t| t.2.map(|k| (t.0, k))).collect();
+    let others: Vec<&Term<'_, 'a>> = terms.iter().filter(|t| t.2.is_none()).collect();
+    let same_k = konsts
+        .iter()
+        .all(|(_, k)| k.ty == konsts[0].1.ty)
+        .then_some(konsts[0].1.ty);
+    let x = others[0]
+        .3
+        .filter(|x| others.iter().all(|o| o.3 == Some(*x)));
+    let join = |types: &[IntTy]| {
+        types[1..]
+            .iter()
+            .fold(types[0], |a, b| common(a, *b, false))
+    };
+    let uniform = terms
+        .iter()
+        .map(|t| t.3)
+        .collect::<Option<Vec<IntTy>>>()
+        .and_then(|types| {
+            let t = join(&types);
+            let bitwise = matches!(c, Chain::And | Chain::Or | Chain::Xor);
+            let unsigned = types.iter().all(|u| !u.signed(false));
+            let same_width = types.iter().all(|u| u.bits() == t.bits());
+            let rest: Vec<IntTy> = others.iter().filter_map(|o| o.3).collect();
+            (same_width || (bitwise && unsigned)).then(|| (t, join(&rest) == t))
+        });
+    let (ty, wraps, droppable) = match (x, same_k) {
+        (Some(x), _) if konsts.iter().all(|(_, k)| common(x, k.ty, false) == x) => (x, true, true),
+        (Some(x), Some(k)) => {
+            let t = common(x, k, false);
+            (t, true, t == x)
+        }
+        _ if uniform.is_some() => {
+            let (t, droppable) = uniform?;
+            (t, true, droppable)
+        }
+        (None, Some(k)) if others.len() == 1 => (k, false, false),
+        _ => return None,
+    };
+    if matches!(c, Chain::Add | Chain::Mul)
+        && others.len() > 1
+        && !others.iter().all(|o| {
+            o.3.is_some_and(|t| !t.signed(false) && t.bits() == ty.bits())
+        })
+    {
+        return None;
+    }
+    let (neg, merged) = merge_konsts(c, &konsts, ty, wraps)?;
+    let keep = !(droppable && neutral(c, merged));
+    let lit = konst_operand(merged)?;
+    let mut lead = terms[0].2.is_some() || others[0].0;
+    if keep && neg && lead && !wraps && !merged.ty.signed(false) {
+        if others[0].0 {
+            return None;
+        }
+        lead = false;
+    }
+    let mut parts: Vec<(bool, E<'a>)> = Vec::new();
+    if keep && lead {
+        parts.push((neg, lit));
+    }
+    for o in &others {
+        parts.push((o.0, clone_e(o.1)));
+    }
+    if keep && !lead {
+        parts.push((neg, konst_operand(merged)?));
+    }
+    if parts[0].0 && !matches!(parts[0].1, E::Lit(_)) {
+        return None;
+    }
+    Some(rebuild(c, op, p, parts))
+}
+
+fn merge_runs<'a>(c: Chain, op: &'a str, p: u8, terms: &[Term<'_, 'a>]) -> Option<E<'a>> {
+    let mut parts: Vec<(bool, E<'a>)> = Vec::new();
+    let mut merged_any = false;
+    let mut i = 0;
+    while i < terms.len() {
+        let mut j = i;
+        if let Some(k) = terms[i].2 {
+            while j + 1 < terms.len() && terms[j + 1].2.is_some_and(|n| n.ty == k.ty) {
+                j += 1;
+            }
+            if j > i {
+                let run: Vec<(bool, Konst)> =
+                    terms[i..=j].iter().map(|t| (t.0, t.2.unwrap())).collect();
+                if let Some((neg, m)) = merge_konsts(c, &run, k.ty, false)
+                    && let Some(lit) = konst_operand(m)
+                {
+                    parts.push((neg, lit));
+                    merged_any = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        parts.push((terms[i].0, clone_e(terms[i].1)));
+        i += 1;
+    }
+    merged_any.then(|| rebuild(c, op, p, parts))
+}
+
+fn regroup<'a>(e: &E<'a>, cx: &Cx<'_, 'a>) -> Option<E<'a>> {
+    let E::Binary(op, p, ..) = e else { return None };
+    let c = chain_of(op)?;
+    let op = if c == Chain::Add { "+" } else { *op };
+    let whole = analyze_terms(e, c, true, cx);
+    let konsts = whole.iter().filter(|t| t.2.is_some()).count();
+    if konsts < 2 || konsts == whole.len() {
+        return None;
+    }
+    gather_all(c, op, *p, &whole).or_else(|| merge_runs(c, op, *p, &analyze_terms(e, c, false, cx)))
+}
+
 fn fold<'a>(e: E<'a>, cx: &Cx<'_, 'a>) -> Folded<'a> {
     match e {
         E::Atom(text) => {
@@ -1260,12 +1581,18 @@ fn fold<'a>(e: E<'a>, cx: &Cx<'_, 'a>) -> Folded<'a> {
                 _ => None,
             };
             let pure = l.pure && r.pure;
-            settle(
-                E::Binary(op, p, Box::new(l.e), Box::new(r.e)),
-                k,
-                true,
-                pure,
-            )
+            let e = E::Binary(op, p, Box::new(l.e), Box::new(r.e));
+            if k.is_none()
+                && let Some(e) = regroup(&e, cx)
+            {
+                return Folded {
+                    e,
+                    k: None,
+                    ops: true,
+                    pure: false,
+                };
+            }
+            settle(e, k, true, pure)
         }
         E::Cast(ty, x) => {
             let mut x = fold(*x, cx);
@@ -1733,6 +2060,80 @@ mod tests {
         let toks = lex::lex_all(src.as_bytes(), false, &mut it);
         let known: FxHashSet<Sym> = known.iter().map(|k| it.intern(k)).collect();
         simplify(&toks, &it, &known, &c_type::Basic { lp64: true })
+    }
+
+    #[test]
+    fn regroups_constants_only_where_the_value_and_type_stay() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "(((pmd) & 0xffffffffffe00000UL) & 0xffffffffffffUL) >> 12",
+                &["pmd"],
+                "(pmd & 0xffffffe00000UL) >> 12",
+            ),
+            (
+                "((pmd & (~((1UL << 21) - 1))) & ((1UL << 48) - 1)) >> 12",
+                &["pmd"],
+                "(pmd & 0xffffffe00000UL) >> 12",
+            ),
+            ("x + (1 << 4) - (-(2 + 1))", &["x"], "x + 0x13"),
+            ("x & 0xf0 & 0x3c", &["x"], "x & 0x30"),
+            ("0xf0 & x & 0x3c", &["x"], "0x30 & x"),
+            ("0x3c & (x & 0xf0)", &["x"], "0x30 & x"),
+            ("x | 1 | 2", &["x"], "x | 0x3"),
+            ("x ^ 0xff ^ 0xff", &["x"], "x ^ 0"),
+            ("x + 1 + 2", &["x"], "x + 3"),
+            ("x - 1 - 2", &["x"], "x - 3"),
+            ("x + 1 - 3", &["x"], "x - 2"),
+            ("1 - x - 4", &["x"], "-3 - x"),
+            ("0x1fU + (g - 0x80000000)", &["g"], "g - 0x7fffffe1U"),
+            ("1U - x - 4U", &["x"], "1U - x - 4U"),
+            ("x * 2 * 3", &["x"], "x * 6"),
+            ("x + 1 - 1", &["x"], "x + 0"),
+            ("(int)x + 1 - 1", &["x"], "(int)x"),
+            ("(unsigned long)x | 0UL | 0", &["x"], "(unsigned long)x"),
+            (
+                "(unsigned long)x & 0xff & 0xfUL",
+                &["x"],
+                "(unsigned long)x & 0xfUL",
+            ),
+            (
+                "(int)a + 1 + (int)b + 2",
+                &["a", "b"],
+                "(int)a + 1 + (int)b + 2",
+            ),
+            (
+                "(unsigned)a + 1U + (unsigned)b + 2U",
+                &["a", "b"],
+                "(unsigned)a + (unsigned)b + 3U",
+            ),
+            (
+                "(long)h * 7 * (2147483647 * 0x3c)",
+                &["h"],
+                "(long)h * 7 * (2147483647 * 0x3c)",
+            ),
+            (
+                "(unsigned)x + 0xffffffffU + 2U",
+                &["x"],
+                "(unsigned)x + 0x1U",
+            ),
+            (
+                "(unsigned long)x * 0x10 * 0x100UL",
+                &["x"],
+                "(unsigned long)x * 0x1000UL",
+            ),
+            ("(int)x & -16 & 0xff", &["x"], "(int)x & 0xf0"),
+            ("x & 0xffUL & 0xf", &["x"], "x & 0xffUL & 0xf"),
+            ("a + 1 + b + 2", &["a", "b"], "a + 1 + b + 2"),
+            (
+                "x & (y & 0xf0) & 0x3c",
+                &["x", "y"],
+                "x & (y & 0xf0) & 0x3c",
+            ),
+            ("x + 2147483647 + 1", &["x"], "x + 2147483647 + 1"),
+        ];
+        for (src, known, want) in cases {
+            assert_eq!(run(src, known).as_deref(), Some(*want), "{src}");
+        }
     }
 
     #[test]

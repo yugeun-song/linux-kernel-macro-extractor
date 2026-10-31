@@ -580,3 +580,158 @@ fn folded_constants_keep_their_value_and_type() {
     }
 }
 
+const CHAIN_VARS: &[(&str, &str)] = &[
+    ("int", "a"),
+    ("unsigned", "b"),
+    ("long", "c"),
+    ("unsigned long", "d"),
+    ("short", "e"),
+    ("unsigned char", "f"),
+    ("long long", "g"),
+    ("unsigned long long", "h"),
+];
+const CHAIN_LITERALS: &[&str] = &[
+    "0",
+    "1",
+    "2",
+    "7",
+    "0x3c",
+    "0xf0",
+    "0xffUL",
+    "3U",
+    "0x80000000",
+    "2147483647",
+    "4294967295U",
+    "0xffffffffffffffffUL",
+    "1LL",
+    "9223372036854775807L",
+    "(-16)",
+    "0xffffffffffe00000UL",
+    "0xffffffffffffUL",
+    "4096",
+    "12UL",
+    "0x1fU",
+];
+const CHAIN_CASTS: &[&str] = &[
+    "int",
+    "unsigned",
+    "long",
+    "unsigned long",
+    "short",
+    "unsigned char",
+];
+
+fn chain_term(r: &mut Rng) -> String {
+    if r.chance(50) {
+        return r.pick(CHAIN_LITERALS).to_string();
+    }
+    let v = CHAIN_VARS[r.below(CHAIN_VARS.len() as u64) as usize].1;
+    if r.chance(30) {
+        format!("({}){v}", r.pick(CHAIN_CASTS))
+    } else {
+        v.to_string()
+    }
+}
+
+fn chain_tree(r: &mut Rng, terms: &[String], ops: &[&str]) -> String {
+    if terms.len() == 1 {
+        return terms[0].clone();
+    }
+    let cut = 1 + r.below(terms.len() as u64 - 1) as usize;
+    let op = r.pick(ops);
+    format!(
+        "({} {op} {})",
+        chain_tree(r, &terms[..cut], ops),
+        chain_tree(r, &terms[cut..], ops)
+    )
+}
+
+#[test]
+fn regrouped_chains_keep_value_and_type() {
+    let Some(count) = std::env::var("KMX_C_EXPR_ORACLE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        eprintln!("KMX_C_EXPR_ORACLE is not set; skipping the chain regrouping oracle");
+        return;
+    };
+    let seed: u64 = std::env::var("KMX_C_EXPR_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let mut r = Rng(seed | 3);
+    let families: &[&[&str]] = &[&["&"], &["|"], &["^"], &["+", "-"], &["*"]];
+    let params: Vec<String> = CHAIN_VARS.iter().map(|(t, v)| format!("{t} {v}")).collect();
+    let mut src = String::from(
+        "#include <stdio.h>\nstatic int fails;\n\
+         #define CHECK(i, E, S) do { __typeof__(E) o_ = (E); __typeof__(S) s_ = (S); \
+         _Static_assert(__builtin_types_compatible_p(__typeof__(E), __typeof__(S)), \"type \" #i); \
+         if (o_ != s_) { printf(\"case %d differs\\n\", i); fails++; } } while (0)\n",
+    );
+    let _ = writeln!(src, "static void cases({}) {{", params.join(", "));
+    let mut changed = 0;
+    let mut cases = Vec::new();
+    for i in 0..count {
+        let ops = families[r.below(families.len() as u64) as usize];
+        let n = 2 + r.below(5) as usize;
+        let terms: Vec<String> = (0..n).map(|_| chain_term(&mut r)).collect();
+        let e = chain_tree(&mut r, &terms, ops);
+        let mut it = Interner::new();
+        let toks = lex_all(e.as_bytes(), false, &mut it);
+        let known: FxHashSet<_> = CHAIN_VARS.iter().map(|(_, v)| it.intern(v)).collect();
+        let simple = simplify(&toks, &it, &known, &LP64).unwrap_or_else(|| e.clone());
+        if simple != e {
+            changed += 1;
+        }
+        let _ = writeln!(src, "    CHECK({i}, {e}, {simple});");
+        cases.push((e, simple));
+    }
+    src.push_str(
+        "}\nstatic unsigned long long s = 0x9e3779b97f4a7c15ULL;\n\
+         static unsigned long long rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; \
+         switch (s % 8) { case 0: return 0; case 1: return ~0ULL; case 2: return s % 16; \
+         case 3: return 1ULL << (s % 64); default: return s; } }\n\
+         int main(void) {\n    for (int k = 0; k < 400; k++)\n        \
+         cases(rnd(), rnd(), rnd(), rnd(), rnd(), rnd(), rnd(), rnd());\n    \
+         return fails != 0;\n}\n",
+    );
+    let dir = std::env::temp_dir().join(format!("kmx-chain-oracle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (file, exe) = (dir.join("chains.c"), dir.join("chains"));
+    std::fs::write(&file, &src).unwrap();
+    let built = Command::new("gcc")
+        .args(["-w", "-std=gnu11", "-O1", "-fwrapv", "-o"])
+        .arg(&exe)
+        .arg(&file)
+        .output()
+        .expect("gcc runs");
+    assert!(
+        built.status.success(),
+        "gcc rejected a case: {}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let ran = Command::new(&exe).output().expect("the oracle runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("{count} chains, {changed} rewritten");
+    let out = String::from_utf8_lossy(&ran.stdout);
+    let mut bad: Vec<usize> = out
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("case ")?
+                .strip_suffix(" differs")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    bad.sort_unstable();
+    bad.dedup();
+    let shown: Vec<String> = bad
+        .iter()
+        .map(|&i| format!("{}  =>  {}", cases[i].0, cases[i].1))
+        .collect();
+    assert!(
+        ran.status.success(),
+        "regrouped chains differ:\n{}",
+        shown.join("\n")
+    );
+}

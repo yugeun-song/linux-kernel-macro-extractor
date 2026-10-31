@@ -57,6 +57,9 @@ Results are cleaned up only by rewrites that hold for every C expression:
   `order_base_2(sizeof(struct page))` on 6.18 arm64 ends as `6`.
 - An enum constant in an expression becomes its value when the build's DWARF
   holds its enum, the enum is visible in the context, and the value fits `int`.
+- The constants of a chain of `&`, `|`, `^`, `+`/`-` or `*` combine into one
+  wherever they stand, when the operand types make that exact:
+  `pmd & 0xffffffffffe00000UL & 0xffffffffffffUL` becomes `pmd & 0xffffffe00000UL`.
 - A cast repeated on its own result is written once:
   `(unsigned long)(unsigned long)address` becomes `(unsigned long)address`, as
   in riscv64's `virt_to_phys`, whose `__pa()` casts what it already cast.
