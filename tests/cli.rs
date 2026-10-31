@@ -976,6 +976,28 @@ const REFINE: &str = "#ifndef _LINUX_REFINE_H\n#define _LINUX_REFINE_H\n\
 #endif\n";
 
 #[test]
+fn an_empty_expansion_says_so_in_the_headline() {
+    let Some(f) = Fixture::new() else { return };
+    write(
+        &f.tree.join("include/linux/blank.h"),
+        "#ifndef _LINUX_BLANK_H\n#define _LINUX_BLANK_H\n#define BLANK_ATTR\n#endif\n",
+    );
+    f.commit("blank");
+    let out = f.stdout(&[
+        "BLANK_ATTR",
+        "--include",
+        "<linux/blank.h>",
+        "--brief",
+        "--ascii",
+    ]);
+    assert_eq!(
+        out.lines().next(),
+        Some("BLANK_ATTR -> (expands to nothing)"),
+        "{out}"
+    );
+}
+
+#[test]
 fn conclusions_are_refined_and_every_node_leads_with_its_result() {
     let Some(f) = Fixture::new() else { return };
     write(&f.tree.join("include/linux/refine.h"), REFINE);

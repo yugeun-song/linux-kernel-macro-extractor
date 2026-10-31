@@ -949,13 +949,18 @@ pub fn headline(r: &Report, o: &Opts) -> Vec<String> {
                         .unwrap_or(&e.result);
                     let shown = clip(shown, limit);
                     let call = c_format::one_line(&e.call);
+                    let rhs = if shown.trim().is_empty() {
+                        Rhs::Plain(paint("(expands to nothing)", style::DIM))
+                    } else {
+                        Rhs::Code(shown, String::new())
+                    };
                     headline.header(
                         &mut title_lines,
                         "",
                         &call,
                         &paint(&call, style::QUERY),
                         &format!(" {} ", paint(g.arrow, style::DIM)),
-                        &Rhs::Code(shown, String::new()),
+                        &rhs,
                     );
                 }
             }
