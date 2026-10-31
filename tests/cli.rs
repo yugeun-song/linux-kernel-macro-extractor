@@ -656,7 +656,7 @@ fn manages_indexes_without_touching_the_tree() {
     assert_eq!(
         header,
         [
-            "ID", "KERNEL", "COMMIT", "HASH", "CONTENT", "ARCH", "STATE", "INDEXED", "SIZE", "TREE"
+            "ID", "KERNEL", "COMMIT", "CONTENT", "ARCH", "STATE", "INDEXED", "SIZE", "TREE"
         ]
     );
     let row = lines.next().unwrap();
@@ -686,7 +686,7 @@ fn manages_indexes_without_touching_the_tree() {
         "{narrow}"
     );
     assert!(
-        narrow.contains("├─ commit hash  ") && narrow.contains("└─ tree         "),
+        narrow.contains("├─ commit   ") && narrow.contains("└─ tree     "),
         "{narrow}"
     );
     let json: serde_json::Value =

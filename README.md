@@ -578,7 +578,7 @@ kept next to the index and replaced when what they depend on changes.
 
 ```
 $ kmx ls
-ID            KERNEL    COMMIT HASH   CONTENT       ARCH    STATE       INDEXED     SIZE      TREE
+ID            KERNEL    COMMIT        CONTENT       ARCH    STATE       INDEXED     SIZE      TREE
 fc789d5303c8  4.6.7     096998b11906  78cdbc68fe13  arm64   up to date  1 hour ago  31.9 MiB  ~/kernels/v4.6-arm64/kernel
 2c2efcc13985  6.12.112  7aba70ab2e8d  7144062f30c5  x86_64  HEAD moved  3 days ago  87.1 MiB  ~/kernels/v6.12-x86_64/kernel
 2 kernel trees, 119.0 MiB in ~/.local/share/kmx
@@ -589,11 +589,11 @@ is not a terminal), `kmx ls` prints one tree per index instead:
 
 ```
 fc789d5303c8  4.6.7  arm64  up to date
-├─ commit hash  096998b11906
-├─ content      78cdbc68fe13
-├─ indexed      1 hour ago
-├─ size         31.9 MiB
-└─ tree         ~/kernels/v4.6-arm64/kernel
+├─ commit   096998b11906
+├─ content  78cdbc68fe13
+├─ indexed  1 hour ago
+├─ size     31.9 MiB
+└─ tree     ~/kernels/v4.6-arm64/kernel
 ```
 
 `CONTENT` is the git tree hash of the indexed HEAD, with `+` when the index

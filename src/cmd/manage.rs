@@ -160,15 +160,7 @@ pub fn ls(g: &Global) -> Result<i32> {
         })
         .collect();
     let header = [
-        "ID",
-        "KERNEL",
-        "COMMIT HASH",
-        "CONTENT",
-        "ARCH",
-        "STATE",
-        "INDEXED",
-        "SIZE",
-        "TREE",
+        "ID", "KERNEL", "COMMIT", "CONTENT", "ARCH", "STATE", "INDEXED", "SIZE", "TREE",
     ];
     let wide = table::wide(&header, &body);
     let fits =
