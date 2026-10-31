@@ -737,6 +737,9 @@ fn node(out: &mut Vec<String>, n: &ExpNode, prefix: &str, root: bool, last: bool
         }
         _ => {}
     }
+    if let Some(l) = &n.layout {
+        layout_lines(out, l, &body_prefix);
+    }
     if let Some(cfg) = &n.config {
         out.push(format!(
             "{body_prefix}{}",
@@ -795,6 +798,56 @@ fn node(out: &mut Vec<String>, n: &ExpNode, prefix: &str, root: bool, last: bool
     for (i, c) in n.children.iter().enumerate() {
         node(out, c, &child_prefix, false, i + 1 == count, o);
     }
+}
+
+fn layout_lines(out: &mut Vec<String>, l: &crate::analysis::report::TypeLayout, prefix: &str) {
+    let tabular = l.members.iter().any(|m| !m.offset.is_empty());
+    if tabular {
+        let ow = l
+            .members
+            .iter()
+            .map(|m| m.offset.len())
+            .max()
+            .unwrap_or(0)
+            .max("offset".len());
+        let sw = l
+            .members
+            .iter()
+            .map(|m| m.size.len())
+            .max()
+            .unwrap_or(0)
+            .max("size".len());
+        out.push(format!(
+            "{prefix}{}",
+            paint(
+                &format!("{:>ow$}  {:>sw$}  member", "offset", "size"),
+                style::DIM
+            )
+        ));
+        for m in &l.members {
+            out.push(format!(
+                "{prefix}{:>ow$}  {:>sw$}  {}",
+                m.offset,
+                m.size,
+                style::code(&m.decl)
+            ));
+        }
+    } else {
+        for m in &l.members {
+            out.push(format!("{prefix}{}", style::code(&m.decl)));
+        }
+    }
+    if l.hidden > 0 {
+        let what = if tabular { "members" } else { "enumerators" };
+        out.push(format!(
+            "{prefix}{}",
+            paint(&format!("… {} more {what} (--all)", l.hidden), style::DIM)
+        ));
+    }
+    out.push(format!(
+        "{prefix}{}",
+        paint(&format!("({})", l.source), style::DIM)
+    ));
 }
 
 pub fn headline(r: &Report, o: &Opts) -> Vec<String> {

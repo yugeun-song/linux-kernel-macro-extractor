@@ -1,6 +1,8 @@
 use rustc_hash::FxHashSet;
 
 use super::c_const::{self, Konst};
+use super::c_type::{self, Base, Step, TypeEnv};
+use super::value::{IntTy, common, promote};
 use crate::intern::{Interner, Sym};
 use crate::syntax::lex::{self, Token, TokenKind};
 
@@ -898,6 +900,7 @@ struct Folded<'a> {
     e: E<'a>,
     k: Option<Konst>,
     ops: bool,
+    pure: bool,
 }
 
 fn leaf(e: E<'_>) -> Folded<'_> {
@@ -905,10 +908,12 @@ fn leaf(e: E<'_>) -> Folded<'_> {
         e,
         k: None,
         ops: false,
+        pure: false,
     }
 }
 
-fn settle<'a>(e: E<'a>, k: Option<Konst>, ops: bool) -> Folded<'a> {
+fn settle<'a>(e: E<'a>, k: Option<Konst>, ops: bool, pure: bool) -> Folded<'a> {
+    let pure = pure && k.is_some();
     if ops
         && let Some(konst) = k
         && let Some((neg, text)) = c_const::spell(konst)
@@ -919,19 +924,43 @@ fn settle<'a>(e: E<'a>, k: Option<Konst>, ops: bool) -> Folded<'a> {
         } else {
             lit
         };
-        return Folded { e, k, ops };
+        return Folded { e, k, ops, pure };
     }
-    Folded { e, k, ops }
+    Folded { e, k, ops, pure }
 }
 
-fn fold_item(item: Item<'_>) -> Item<'_> {
+struct Cx<'c, 'a> {
+    env: &'c dyn TypeEnv,
+    bound: FxHashSet<&'a str>,
+}
+
+impl<'a> Cx<'_, 'a> {
+    fn inner(&self, items: &[Item<'a>]) -> Cx<'_, 'a> {
+        let mut bound = self.bound.clone();
+        for item in items {
+            if let Item::Decl(_, decls, _) = item {
+                for (d, _) in decls {
+                    if let Some(name) = d.last() {
+                        bound.insert(name.text);
+                    }
+                }
+            }
+        }
+        Cx {
+            env: self.env,
+            bound,
+        }
+    }
+}
+
+fn fold_item<'a>(item: Item<'a>, cx: &Cx<'_, 'a>) -> Item<'a> {
     match item {
-        Item::Expr(e, semi) => Item::Expr(fold(e).e, semi),
+        Item::Expr(e, semi) => Item::Expr(fold(e, cx).e, semi),
         Item::Decl(spec, decls, semi) => Item::Decl(
             spec,
             decls
                 .into_iter()
-                .map(|(d, init)| (d, init.map(|e| fold(e).e)))
+                .map(|(d, init)| (d, init.map(|e| fold(e, cx).e)))
                 .collect(),
             semi,
         ),
@@ -939,28 +968,307 @@ fn fold_item(item: Item<'_>) -> Item<'_> {
     }
 }
 
-fn fold(e: E<'_>) -> Folded<'_> {
+fn ident(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && !is_keyword(text)
+}
+
+fn texts<'a>(toks: &[T<'a>]) -> Vec<&'a str> {
+    toks.iter().map(|t| t.text).collect()
+}
+
+fn null_pointer(e: &E<'_>) -> bool {
     match e {
-        E::Atom(text) => Folded {
-            e: E::Atom(text),
-            k: c_const::literal(text),
-            ops: false,
+        E::Atom(t) => c_const::literal(t).is_some_and(|k| k.v == 0),
+        E::Lit(t) => c_const::literal(t).is_some_and(|k| k.v == 0),
+        E::Cast(ty, x) => texts(ty) == ["void", "*"] && null_pointer(x),
+        _ => false,
+    }
+}
+
+fn pointee<'a>(ty: &[T<'a>]) -> Option<Vec<&'a str>> {
+    let mut words = texts(ty);
+    let star = words.iter().rposition(|w| *w == "*")?;
+    if words[star + 1..]
+        .iter()
+        .any(|w| !matches!(*w, "const" | "volatile" | "__restrict" | "restrict"))
+    {
+        return None;
+    }
+    words.truncate(star);
+    Some(words)
+}
+
+fn member_path<'a>(e: &E<'a>, path: &mut Vec<Step<'a>>) -> Option<Vec<&'a str>> {
+    match e {
+        E::Member(base, op, name) => {
+            let root = match (*op, &**base) {
+                ("->", E::Cast(ty, x)) if null_pointer(x) => Some(pointee(ty)?),
+                (".", E::Prefix("*", inner)) => match &**inner {
+                    E::Cast(ty, x) if null_pointer(x) => Some(pointee(ty)?),
+                    _ => None,
+                },
+                (".", inner) => {
+                    let r = member_path(inner, path)?;
+                    path.push(Step::Field(name));
+                    return Some(r);
+                }
+                _ => None,
+            }?;
+            path.push(Step::Field(name));
+            Some(root)
+        }
+        E::Index(base, idx) => {
+            let r = member_path(base, path)?;
+            let k = fold_ref(idx)?;
+            path.push(Step::Index(u64::try_from(k.v).ok()?));
+            Some(r)
+        }
+        _ => None,
+    }
+}
+
+fn fold_ref(e: &E<'_>) -> Option<Konst> {
+    match e {
+        E::Atom(t) => c_const::literal(t),
+        E::Lit(t) => c_const::literal(t),
+        E::Prefix("-", x) => c_const::unary("-", fold_ref(x)?),
+        _ => None,
+    }
+}
+
+fn base_of<'a>(words: &[&'a str], cx: &Cx<'_, 'a>) -> Option<Base<'a>> {
+    let t = c_type::parse_type_name(words)?;
+    if !t.ops.is_empty() {
+        return None;
+    }
+    match t.base {
+        Base::Typedef(n) if cx.bound.contains(n) => None,
+        b @ (Base::Tag(..) | Base::Typedef(_)) => Some(b),
+        _ => None,
+    }
+}
+
+fn type_of_tokens<'a>(toks: &'a [T<'a>], cx: &Cx<'_, 'a>) -> Option<IntTy> {
+    let scope = Scope::default();
+    if let Ok(e) = Parser::whole(toks, &scope, 0) {
+        let f = fold(e, cx);
+        if let Some(k) = f.k {
+            return Some(k.ty);
+        }
+        if let Some(t) = int_type(&f.e, cx) {
+            return Some(t);
+        }
+    }
+    let words = texts(toks);
+    let t = c_type::parse_type_name(&words)?;
+    if matches!(t.base, Base::Typedef(n) if cx.bound.contains(n)) {
+        return None;
+    }
+    cx.env.int_of(&t)
+}
+
+fn cast_type<'a>(ty: &'a [T<'a>], cx: &Cx<'_, 'a>) -> Option<IntTy> {
+    let words = texts(ty);
+    let t = c_type::parse_type_name(&words)?;
+    if !t.ops.is_empty() {
+        return None;
+    }
+    match t.base {
+        Base::Typedef(n) if cx.bound.contains(n) => None,
+        Base::Typeof(lo, hi) => type_of_tokens(&ty[lo..hi], cx),
+        _ => cx.env.int_of(&t),
+    }
+}
+
+fn size_of_type<'a>(content: &'a [T<'a>], cx: &Cx<'_, 'a>) -> Option<u64> {
+    let words = texts(content);
+    let t = c_type::parse_type_name(&words)?;
+    if matches!(t.base, Base::Typedef(n) if cx.bound.contains(n)) {
+        return None;
+    }
+    let typeof_size = match t.base {
+        Base::Typeof(lo, hi) => type_of_tokens(&content[lo..hi], cx).and_then(c_type::lp64_bytes),
+        _ => None,
+    };
+    cx.env.size_of(&t, typeof_size)
+}
+
+fn size_of_expr<'a>(e: E<'a>, cx: &Cx<'_, 'a>) -> Option<u64> {
+    if !cx.env.lp64() {
+        return None;
+    }
+    let mut path = Vec::new();
+    if let Some(root) = member_path(&e, &mut path) {
+        let base = base_of(&root, cx)?;
+        return cx.env.offset(&base, &path)?.1;
+    }
+    if let E::Cast(ty, _) = &e {
+        return size_of_type(ty, cx);
+    }
+    let f = fold(e, cx);
+    match f.k {
+        Some(k) => c_type::lp64_bytes(k.ty),
+        None => int_type(&f.e, cx).and_then(c_type::lp64_bytes),
+    }
+}
+
+fn sizeof_raw<'a>(raw: &'a [T<'a>], cx: &Cx<'_, 'a>) -> Option<Konst> {
+    let [word, open, content @ .., close] = raw else {
+        return None;
+    };
+    if word.text != "sizeof" || !open.punct("(") || !close.punct(")") || content.is_empty() {
+        return None;
+    }
+    if let Some(n) = size_of_type(content, cx) {
+        return Some(c_const::size_t(n));
+    }
+    let scope = Scope::default();
+    let e = Parser::whole(content, &scope, 0).ok()?;
+    size_of_expr(e, cx).map(c_const::size_t)
+}
+
+fn offsetof<'a>(args: &[E<'a>], cx: &Cx<'_, 'a>) -> Option<Konst> {
+    let [ty, designator] = args else {
+        return None;
+    };
+    let words: Vec<&str> = match ty {
+        E::Raw(t) => texts(t),
+        E::Atom(t) => vec![*t],
+        _ => return None,
+    };
+    let base = base_of(&words, cx)?;
+    let mut path = Vec::new();
+    designator_path(designator, &mut path)?;
+    let (off, _) = cx.env.offset(&base, &path)?;
+    Some(c_const::size_t(off))
+}
+
+fn designator_path<'a>(e: &E<'a>, path: &mut Vec<Step<'a>>) -> Option<()> {
+    match e {
+        E::Atom(name) if ident(name) => path.push(Step::Field(name)),
+        E::Member(base, ".", name) => {
+            designator_path(base, path)?;
+            path.push(Step::Field(name));
+        }
+        E::Index(base, idx) => {
+            designator_path(base, path)?;
+            path.push(Step::Index(u64::try_from(fold_ref(idx)?.v).ok()?));
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn address_offset<'a>(e: &E<'a>, ty: &'a [T<'a>], cx: &Cx<'_, 'a>) -> Option<Konst> {
+    let E::Prefix("&", inner) = e else {
+        return None;
+    };
+    let target = cast_type(ty, cx)?;
+    let mut path = Vec::new();
+    let root = member_path(inner, &mut path)?;
+    let base = base_of(&root, cx)?;
+    let (off, _) = cx.env.offset(&base, &path)?;
+    c_const::cast_to(target, c_const::size_t(off))
+}
+
+const BUILTIN_INT: &[&str] = &[
+    "__builtin_clz",
+    "__builtin_clzl",
+    "__builtin_clzll",
+    "__builtin_ctz",
+    "__builtin_ctzl",
+    "__builtin_ctzll",
+    "__builtin_popcount",
+    "__builtin_popcountl",
+    "__builtin_popcountll",
+    "__builtin_parity",
+    "__builtin_parityl",
+    "__builtin_parityll",
+    "__builtin_ffs",
+    "__builtin_ffsl",
+    "__builtin_ffsll",
+    "__builtin_clrsb",
+    "__builtin_clrsbl",
+    "__builtin_clrsbll",
+    "__builtin_constant_p",
+];
+
+fn int_type<'a>(e: &E<'a>, cx: &Cx<'_, 'a>) -> Option<IntTy> {
+    match e {
+        E::Lit(t) => c_const::literal(t).map(|k| k.ty),
+        E::Atom(t) => match c_const::literal(t) {
+            Some(k) => Some(k.ty),
+            None if ident(t) && !cx.bound.contains(t) => cx.env.enumerator(t).map(|_| IntTy::Int),
+            None => None,
         },
+        E::Prefix(op, x) => match *op {
+            "-" | "+" | "~" => int_type(x, cx).map(promote),
+            "!" => Some(IntTy::Int),
+            _ => None,
+        },
+        E::Binary(op, _, l, r) => match *op {
+            "<<" | ">>" => {
+                int_type(r, cx)?;
+                int_type(l, cx).map(promote)
+            }
+            "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||" => Some(IntTy::Int),
+            _ => Some(common(int_type(l, cx)?, int_type(r, cx)?, false)),
+        },
+        E::Cast(ty, _) => cast_type(ty, cx),
+        E::Cond(_, a, b) => Some(common(int_type(a, cx)?, int_type(b, cx)?, false)),
+        E::Call(f, _) => match &**f {
+            E::Atom(name) if BUILTIN_INT.contains(name) => Some(IntTy::Int),
+            E::Atom("__builtin_bswap32") => Some(IntTy::UInt),
+            E::Atom("__builtin_bswap64") => Some(IntTy::ULong),
+            E::Atom(name) if ident(name) && !cx.bound.contains(name) => cx.env.fn_return(name),
+            _ => None,
+        },
+        E::Raw([w, ..]) if w.text == "sizeof" => cx.env.lp64().then_some(IntTy::ULong),
+        E::Size("sizeof", _) => cx.env.lp64().then_some(IntTy::ULong),
+        _ => None,
+    }
+}
+
+fn fold<'a>(e: E<'a>, cx: &Cx<'_, 'a>) -> Folded<'a> {
+    match e {
+        E::Atom(text) => {
+            if let Some(k) = c_const::literal(text) {
+                return Folded {
+                    e: E::Atom(text),
+                    k: Some(k),
+                    ops: false,
+                    pure: true,
+                };
+            }
+            if ident(text)
+                && !cx.bound.contains(text)
+                && let Some(k) = cx.env.enumerator(text).and_then(c_const::int)
+            {
+                return settle(E::Atom(text), Some(k), true, true);
+            }
+            leaf(E::Atom(text))
+        }
         E::Prefix(op, x) => {
-            let x = fold(*x);
+            let x = fold(*x, cx);
             let k = x.k.and_then(|k| c_const::unary(op, k));
-            settle(E::Prefix(op, Box::new(x.e)), k, x.ops)
+            settle(E::Prefix(op, Box::new(x.e)), k, x.ops, x.pure)
         }
         E::Binary(op, p, l, r) => {
-            let (l, r) = (fold(*l), fold(*r));
+            let (l, r) = (fold(*l, cx), fold(*r, cx));
             let k = match (l.k, r.k) {
                 (Some(a), Some(b)) => c_const::binary(op, a, b),
                 _ => None,
             };
-            settle(E::Binary(op, p, Box::new(l.e), Box::new(r.e)), k, true)
+            let pure = l.pure && r.pure;
+            settle(
+                E::Binary(op, p, Box::new(l.e), Box::new(r.e)),
+                k,
+                true,
+                pure,
+            )
         }
         E::Cast(ty, x) => {
-            let mut x = fold(*x);
+            let mut x = fold(*x, cx);
             if let E::Cast(inner, operand) = x.e {
                 x.e = if basic_type(ty) && same_type(ty, inner) {
                     *operand
@@ -969,36 +1277,155 @@ fn fold(e: E<'_>) -> Folded<'_> {
                 };
             }
             let words: Option<Vec<&str>> = ty.iter().map(|t| t.word().then_some(t.text)).collect();
-            let k = match (x.k, words) {
-                (Some(k), Some(w)) => c_const::cast(&w, k),
-                _ => None,
+            let typed = |k: Konst| cast_type(ty, cx).and_then(|t| c_const::cast_to(t, k));
+            let (k, ops, pure) = match (x.k, words) {
+                (Some(k), Some(w)) => (c_const::cast(&w, k).or_else(|| typed(k)), x.ops, x.pure),
+                (Some(k), None) => (typed(k), x.ops, x.pure),
+                (None, _) => match address_offset(&x.e, ty, cx) {
+                    Some(k) => (Some(k), true, true),
+                    None => (None, x.ops, false),
+                },
             };
-            settle(E::Cast(ty, Box::new(x.e)), k, x.ops)
+            settle(E::Cast(ty, Box::new(x.e)), k, ops, pure)
         }
         E::Cond(c, t, f) => {
-            let (c, t, f) = (fold(*c), fold(*t), fold(*f));
-            let k = match (c.k, t.k, f.k) {
-                (Some(a), Some(b), Some(d)) => c_const::cond(a, b, d),
-                _ => None,
-            };
+            let (c, t, f) = (fold(*c, cx), fold(*t, cx), fold(*f, cx));
+            let pure = c.pure && t.pure && f.pure;
+            if let (Some(a), Some(b), Some(d)) = (c.k, t.k, f.k) {
+                let k = c_const::cond(a, b, d);
+                return settle(
+                    E::Cond(Box::new(c.e), Box::new(t.e), Box::new(f.e)),
+                    k,
+                    true,
+                    pure,
+                );
+            }
+            if let Some(ck) = c.k {
+                let (chosen, other) = if ck.v != 0 { (&t, &f) } else { (&f, &t) };
+                let ct = chosen.k.map(|k| k.ty).or_else(|| int_type(&chosen.e, cx));
+                let ot = other.k.map(|k| k.ty).or_else(|| int_type(&other.e, cx));
+                if let (Some(ct), Some(ot)) = (ct, ot) {
+                    let ty = common(ct, ot, false);
+                    if let Some(k) = chosen.k.and_then(|k| c_const::cast_to(ty, k)) {
+                        return settle(
+                            E::Cond(Box::new(c.e), Box::new(t.e), Box::new(f.e)),
+                            Some(k),
+                            true,
+                            false,
+                        );
+                    }
+                    if chosen.k.is_none() && ty == ct {
+                        let chosen = if ck.v != 0 { t } else { f };
+                        return Folded {
+                            e: chosen.e,
+                            k: None,
+                            ops: true,
+                            pure: false,
+                        };
+                    }
+                }
+            }
             settle(
                 E::Cond(Box::new(c.e), Box::new(t.e), Box::new(f.e)),
-                k,
+                None,
                 true,
+                false,
             )
         }
-        E::Comma(l, r) => leaf(E::Comma(Box::new(fold(*l).e), Box::new(fold(*r).e))),
-        E::Call(f, args) => leaf(E::Call(
-            Box::new(fold(*f).e),
-            args.into_iter().map(|a| fold(a).e).collect(),
+        E::Comma(l, r) => leaf(E::Comma(Box::new(fold(*l, cx).e), Box::new(fold(*r, cx).e))),
+        E::Call(f, args) => {
+            let name = match &*f {
+                E::Atom(n) => Some(*n),
+                _ => None,
+            };
+            match (name, args.len()) {
+                (Some("__builtin_offsetof"), 2) => {
+                    if let Some(k) = offsetof(&args, cx) {
+                        return settle(E::Call(f, args), Some(k), true, true);
+                    }
+                }
+                (Some("__builtin_choose_expr"), 3) => {
+                    let mut args = args;
+                    let c = fold(args.remove(0), cx);
+                    let (a, b) = (args.remove(0), args.remove(0));
+                    if let Some(k) = c.k.filter(|_| c.pure) {
+                        let chosen = fold(if k.v != 0 { a } else { b }, cx);
+                        let pure = chosen.pure;
+                        return settle(chosen.e, chosen.k, true, pure);
+                    }
+                    let (a, b) = (fold(a, cx), fold(b, cx));
+                    return leaf(E::Call(f, vec![c.e, a.e, b.e]));
+                }
+                (Some(n), 1) if n.starts_with("__builtin_") => {
+                    let mut args = args;
+                    let a = fold(args.remove(0), cx);
+                    let (k, pure) = match (n, a.k) {
+                        ("__builtin_constant_p", Some(_)) if a.pure => (c_const::int(1), true),
+                        ("__builtin_constant_p", _) => (None, false),
+                        (_, Some(k)) => (c_const::builtin(n, k), a.pure),
+                        _ => (None, false),
+                    };
+                    return settle(E::Call(f, vec![a.e]), k, true, pure);
+                }
+                _ => {}
+            }
+            leaf(E::Call(
+                Box::new(fold(*f, cx).e),
+                args.into_iter().map(|a| fold(a, cx).e).collect(),
+            ))
+        }
+        E::Index(b, i) => leaf(E::Index(Box::new(fold(*b, cx).e), Box::new(fold(*i, cx).e))),
+        E::Member(b, op, name) => leaf(E::Member(Box::new(fold(*b, cx).e), op, name)),
+        E::Postfix(b, op) => leaf(E::Postfix(Box::new(fold(*b, cx).e), op)),
+        E::Assign(op, l, r) => leaf(E::Assign(
+            op,
+            Box::new(fold(*l, cx).e),
+            Box::new(fold(*r, cx).e),
         )),
-        E::Index(b, i) => leaf(E::Index(Box::new(fold(*b).e), Box::new(fold(*i).e))),
-        E::Member(b, op, name) => leaf(E::Member(Box::new(fold(*b).e), op, name)),
-        E::Postfix(b, op) => leaf(E::Postfix(Box::new(fold(*b).e), op)),
-        E::Assign(op, l, r) => leaf(E::Assign(op, Box::new(fold(*l).e), Box::new(fold(*r).e))),
-        E::Size(word, x) => leaf(E::Size(word, Box::new(fold(*x).e))),
-        E::Block(items) => leaf(E::Block(prune(items.into_iter().map(fold_item).collect()))),
-        other @ (E::Lit(_) | E::Strs(_) | E::Raw(_)) => leaf(other),
+        E::Size(word, x) => {
+            if word == "sizeof"
+                && let Some(n) = size_of_expr(clone_e(&x), cx)
+            {
+                return settle(E::Size(word, x), Some(c_const::size_t(n)), true, true);
+            }
+            leaf(E::Size(word, Box::new(fold(*x, cx).e)))
+        }
+        E::Block(items) => {
+            let inner = cx.inner(&items);
+            leaf(E::Block(prune(
+                items.into_iter().map(|i| fold_item(i, &inner)).collect(),
+            )))
+        }
+        E::Raw(raw) => match sizeof_raw(raw, cx) {
+            Some(k) => settle(E::Raw(raw), Some(k), true, true),
+            None => leaf(E::Raw(raw)),
+        },
+        other @ (E::Lit(_) | E::Strs(_)) => leaf(other),
+    }
+}
+
+fn clone_e<'a>(e: &E<'a>) -> E<'a> {
+    match e {
+        E::Atom(t) => E::Atom(t),
+        E::Lit(t) => E::Lit(t.clone()),
+        E::Block(_) => E::Raw(&[]),
+        E::Strs(p) => E::Strs(p.clone()),
+        E::Raw(r) => E::Raw(r),
+        E::Cast(t, x) => E::Cast(t, Box::new(clone_e(x))),
+        E::Prefix(o, x) => E::Prefix(o, Box::new(clone_e(x))),
+        E::Size(w, x) => E::Size(w, Box::new(clone_e(x))),
+        E::Postfix(x, o) => E::Postfix(Box::new(clone_e(x)), o),
+        E::Call(f, a) => E::Call(Box::new(clone_e(f)), a.iter().map(clone_e).collect()),
+        E::Index(b, i) => E::Index(Box::new(clone_e(b)), Box::new(clone_e(i))),
+        E::Member(b, o, n) => E::Member(Box::new(clone_e(b)), o, n),
+        E::Binary(o, p, l, r) => E::Binary(o, *p, Box::new(clone_e(l)), Box::new(clone_e(r))),
+        E::Cond(c, t, f) => E::Cond(
+            Box::new(clone_e(c)),
+            Box::new(clone_e(t)),
+            Box::new(clone_e(f)),
+        ),
+        E::Assign(o, l, r) => E::Assign(o, Box::new(clone_e(l)), Box::new(clone_e(r))),
+        E::Comma(l, r) => E::Comma(Box::new(clone_e(l)), Box::new(clone_e(r))),
     }
 }
 
@@ -1213,29 +1640,73 @@ fn tokens<'a>(toks: &[Token], it: &'a Interner) -> Option<Vec<T<'a>>> {
         .then_some(out)
 }
 
-pub fn simplify(toks: &[Token], it: &Interner, known: &FxHashSet<Sym>) -> Option<String> {
+pub fn simplify(
+    toks: &[Token],
+    it: &Interner,
+    known: &FxHashSet<Sym>,
+    env: &dyn TypeEnv,
+) -> Option<String> {
+    analyze(toks, it, known, env).map(|(text, _)| text)
+}
+
+pub fn evaluate(
+    toks: &[Token],
+    it: &Interner,
+    known: &FxHashSet<Sym>,
+    env: &dyn TypeEnv,
+) -> Option<Konst> {
+    analyze(toks, it, known, env).and_then(|(_, k)| k)
+}
+
+fn analyze(
+    toks: &[Token],
+    it: &Interner,
+    known: &FxHashSet<Sym>,
+    env: &dyn TypeEnv,
+) -> Option<(String, Option<Konst>)> {
     if toks.is_empty() || toks.len() > MAX_TOKENS {
         return None;
     }
     let ts = tokens(toks, it)?;
     let mut body: &[T<'_>] = &ts;
     let mut stripped = None;
-    let scope = Scope {
+    let mut scope = Scope {
         vars: known.clone(),
         types: FxHashSet::default(),
+    };
+    for w in ts.windows(3) {
+        if !(w[0].punct("(") && w[1].word() && w[2].punct(")"))
+            || known.contains(&w[1].sym)
+            || is_keyword(w[1].text)
+            || scope.vars.contains(&w[1].sym)
+            || scope.types.contains(&w[1].sym)
+        {
+            continue;
+        }
+        if env.enumerator(w[1].text).is_some() {
+            scope.vars.insert(w[1].sym);
+        } else if env.is_typedef(w[1].text) {
+            scope.types.insert(w[1].sym);
+        }
+    }
+    let cx = Cx {
+        env,
+        bound: known.iter().map(|s| it.get(*s)).collect(),
     };
     loop {
         match Parser::whole(body, &scope, 0) {
             Ok(E::Raw(raw)) if raw.len() == body.len() && raw[0].punct("(") => {
                 let inner = &body[1..body.len() - 1];
                 if inner.is_empty() || inner[0].punct("{") {
-                    return Some(render(body));
+                    return Some((render(body), None));
                 }
                 stripped = Some(render(inner));
                 body = inner;
             }
             Ok(e) => {
-                let e = fold(e).e;
+                let folded = fold(e, &cx);
+                let k = folded.k;
+                let e = folded.e;
                 let mut out = String::new();
                 print(
                     &e,
@@ -1246,9 +1717,9 @@ pub fn simplify(toks: &[Token], it: &Interner, known: &FxHashSet<Sym>) -> Option
                     },
                     &mut out,
                 );
-                return Some(out);
+                return Some((out, k));
             }
-            Err(Fail) => return stripped,
+            Err(Fail) => return stripped.map(|s| (s, None)),
         }
     }
 }
@@ -1261,7 +1732,7 @@ mod tests {
         let mut it = Interner::new();
         let toks = lex::lex_all(src.as_bytes(), false, &mut it);
         let known: FxHashSet<Sym> = known.iter().map(|k| it.intern(k)).collect();
-        simplify(&toks, &it, &known)
+        simplify(&toks, &it, &known, &c_type::Basic { lp64: true })
     }
 
     #[test]
@@ -1426,7 +1897,39 @@ mod tests {
             ("(2147483647 + 1)", &[], Some("2147483647 + 1")),
             ("((1, 2) + 3)", &[], Some("(1, 2) + 3")),
             ("(a - (2 - 5))", &[], Some("a - -3")),
-            ("sizeof(( long)(x))", &[], Some("sizeof((long)(x))")),
+            ("sizeof(( long)(x))", &[], Some("8UL")),
+            ("(sizeof(unsigned long) * 8)", &[], Some("64UL")),
+            ("sizeof(int[4]) + sizeof(char *)", &[], Some("24UL")),
+            ("sizeof(int[n])", &[], Some("sizeof(int[n])")),
+            ("__builtin_constant_p(4096UL)", &[], Some("1")),
+            (
+                "__builtin_constant_p(x)",
+                &[],
+                Some("__builtin_constant_p(x)"),
+            ),
+            ("__builtin_choose_expr(1, a, b)", &[], Some("a")),
+            (
+                "__builtin_choose_expr(sizeof(int) == 4, 1UL, 2)",
+                &[],
+                Some("1UL"),
+            ),
+            ("((typeof(1UL))0x40000000 - 1)", &[], Some("0x3fffffffUL")),
+            (
+                "__builtin_constant_p(63UL) ? 63 - __builtin_clzll(63UL) : f(63UL)",
+                &[],
+                Some("1 ? 5 : f(63UL)"),
+            ),
+            (
+                "__builtin_constant_p(63UL) ? 63 - __builtin_clzll(63UL) : (int)f(63UL)",
+                &[],
+                Some("5"),
+            ),
+            ("sizeof((sizeof(int)) - 1) <= 4 ? 1 : 2", &[], Some("2")),
+            ("1 ? (int)x : (int)y", &[], Some("(int)x")),
+            ("0 ? (int)x : (long)y", &[], Some("(long)y")),
+            ("1 ? (int)x : (long)y", &[], Some("1 ? (int)x : (long)y")),
+            ("1 ? 5 : (long)y", &[], Some("5L")),
+            ("__builtin_ffsll(0x100ULL) + 0", &[], Some("9")),
         ];
         for (src, known, want) in cases {
             assert_eq!(run(src, known).as_deref(), *want, "{src} with {known:?}");

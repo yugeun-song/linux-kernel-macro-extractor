@@ -65,6 +65,15 @@ impl Trace {
         }
     }
 
+    fn hops(&self, mut n: u32, ancestor: u32) -> Option<u16> {
+        let mut d = 0u16;
+        while n > ancestor {
+            n = self.nodes[n as usize].parent;
+            d = d.checked_add(1)?;
+        }
+        (n == ancestor && d > 0).then_some(d)
+    }
+
     pub fn is_descendant(&self, mut n: u32, ancestor: u32) -> bool {
         if ancestor == 0 {
             return true;
@@ -88,9 +97,14 @@ impl Trace {
         }
         for t in output {
             let mut n = t.origin;
+            let mut skip = t.skip;
             while n != 0 {
                 let node = &mut self.nodes[n as usize];
-                node.result.push(*t);
+                if skip > 0 {
+                    skip -= 1;
+                } else {
+                    node.result.push(*t);
+                }
                 n = node.parent;
             }
             self.nodes[0].result.push(*t);
@@ -240,6 +254,7 @@ impl<'e> Expander<'e> {
                 let mut v = self.env.builtin(b);
                 v.flags = (v.flags & !F_SPACE) | (t.flags & F_SPACE);
                 v.origin = t.origin;
+                v.skip = t.skip;
                 out.push(v);
                 continue;
             }
@@ -293,6 +308,7 @@ impl<'e> Expander<'e> {
                 && (!trace.is_descendant(t.origin, node) || t.origin == 0)
             {
                 t.origin = node;
+                t.skip = 0;
             }
         }
         if let Some(first) = out.first_mut() {
@@ -361,7 +377,15 @@ impl<'e> Expander<'e> {
         node: u32,
     ) -> Vec<Token> {
         if let Some(v) = &cache[p] {
-            return v.clone();
+            let mut copy = v.clone();
+            if let Some(trace) = &self.trace
+                && node != 0
+            {
+                for t in &mut copy {
+                    t.skip = trace.hops(t.origin, node).unwrap_or(t.skip);
+                }
+            }
+            return copy;
         }
         self.depth += 1;
         let v = self.expand_in(args[p].clone(), node, Phase::Arg(p as u16));
@@ -879,5 +903,36 @@ mod tests {
             lex::render(&out, &e.it)
         );
         assert_eq!(lex::render(&trace.nodes[4].result, &e.it), "12");
+    }
+
+    #[test]
+    fn an_argument_used_twice_keeps_one_result_per_node() {
+        let mut e = TestEnv::new(&[
+            "PAGE_SHIFT 12",
+            "PAGE_SIZE (1UL << PAGE_SHIFT)",
+            "PER_ROOT (PAGE_SIZE / 16)",
+            "DIV_UP(n, d) (((n) + (d) - 1) / (d))",
+            "TWICE(x) x x",
+        ]);
+        let toks = lex::lex_all(b"DIV_UP(7, PER_ROOT) TWICE(PAGE_SHIFT)", false, &mut e.it);
+        let mut ex = Expander::new(&mut e, false).traced();
+        let out = ex.expand(toks);
+        let trace = ex.into_trace().unwrap();
+        let result = |name: &str| -> Vec<String> {
+            trace.nodes[1..]
+                .iter()
+                .filter(|n| e.it.get(n.sym) == name)
+                .map(|n| lex::render(&n.result, &e.it))
+                .collect()
+        };
+        assert_eq!(result("PER_ROOT"), vec!["((1UL << 12) / 16)"]);
+        assert_eq!(result("PAGE_SIZE"), vec!["(1UL << 12)"]);
+        assert_eq!(result("PAGE_SHIFT"), vec!["12", "12"]);
+        assert_eq!(
+            result("DIV_UP"),
+            vec!["(((7) + (((1UL << 12) / 16)) - 1) / (((1UL << 12) / 16)))"]
+        );
+        assert_eq!(result("TWICE"), vec!["12 12"]);
+        assert!(lex::render(&out, &e.it).ends_with("12 12"));
     }
 }

@@ -157,6 +157,23 @@ pub struct ExpNode {
     pub kconfig: Option<KconfigInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<CTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<TypeLayout>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TypeLayout {
+    pub size: Option<u64>,
+    pub members: Vec<LayoutMember>,
+    pub hidden: usize,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayoutMember {
+    pub offset: String,
+    pub size: String,
+    pub decl: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

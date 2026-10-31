@@ -22,6 +22,7 @@ pub const F_BOL: u8 = 4;
 pub struct Token {
     pub kind: TokenKind,
     pub flags: u8,
+    pub skip: u16,
     pub sym: Sym,
     pub hs: u32,
     pub origin: u32,
@@ -33,6 +34,7 @@ impl Token {
         Token {
             kind,
             flags,
+            skip: 0,
             sym,
             hs: 0,
             origin: 0,

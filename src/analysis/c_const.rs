@@ -265,11 +265,97 @@ pub fn cast(words: &[&str], a: Konst) -> Option<Konst> {
         (false, _) => IntTy::LongLong,
         (true, _) => IntTy::ULongLong,
     };
+    cast_to(ty, a)
+}
+
+pub fn cast_to(ty: IntTy, a: Konst) -> Option<Konst> {
+    if !integer(a.ty) || !integer(ty) {
+        return None;
+    }
     Some(Konst {
         v: convert(a.v, ty)?,
         ty,
         hex: a.hex,
     })
+}
+
+pub fn size_t(v: u64) -> Konst {
+    Konst {
+        v: i128::from(v),
+        ty: IntTy::ULong,
+        hex: false,
+    }
+}
+
+pub fn int(v: i128) -> Option<Konst> {
+    fits(v, IntTy::Int).then_some(Konst {
+        v,
+        ty: IntTy::Int,
+        hex: false,
+    })
+}
+
+pub fn builtin(name: &str, a: Konst) -> Option<Konst> {
+    if !integer(a.ty) {
+        return None;
+    }
+    let (param, op) = match name.strip_prefix("__builtin_")? {
+        "clz" => (IntTy::UInt, "clz"),
+        "clzl" => (IntTy::ULong, "clz"),
+        "clzll" => (IntTy::ULongLong, "clz"),
+        "ctz" => (IntTy::UInt, "ctz"),
+        "ctzl" => (IntTy::ULong, "ctz"),
+        "ctzll" => (IntTy::ULongLong, "ctz"),
+        "popcount" => (IntTy::UInt, "popcount"),
+        "popcountl" => (IntTy::ULong, "popcount"),
+        "popcountll" => (IntTy::ULongLong, "popcount"),
+        "parity" => (IntTy::UInt, "parity"),
+        "parityl" => (IntTy::ULong, "parity"),
+        "parityll" => (IntTy::ULongLong, "parity"),
+        "ffs" => (IntTy::Int, "ffs"),
+        "ffsl" => (IntTy::Long, "ffs"),
+        "ffsll" => (IntTy::LongLong, "ffs"),
+        "clrsb" => (IntTy::Int, "clrsb"),
+        "clrsbl" => (IntTy::Long, "clrsb"),
+        "clrsbll" => (IntTy::LongLong, "clrsb"),
+        "bswap32" => (IntTy::UInt, "bswap"),
+        "bswap64" => (IntTy::ULong, "bswap"),
+        _ => return None,
+    };
+    let v = convert(a.v, param)?;
+    let w = param.bits();
+    let bits = (v as u128) & ((1u128 << w) - 1);
+    let n = match op {
+        "clz" if bits == 0 => return None,
+        "clz" => i128::from(w - (128 - bits.leading_zeros())),
+        "ctz" if bits == 0 => return None,
+        "ctz" => i128::from(bits.trailing_zeros()),
+        "popcount" => i128::from(bits.count_ones()),
+        "parity" => i128::from(bits.count_ones() & 1),
+        "ffs" if bits == 0 => 0,
+        "ffs" => i128::from(bits.trailing_zeros() + 1),
+        "clrsb" => {
+            let sign = bits >> (w - 1) & 1;
+            let mut same = 0;
+            while same < w && (bits >> (w - 1 - same) & 1) == sign {
+                same += 1;
+            }
+            i128::from(same - 1)
+        }
+        _ => {
+            let bytes = (w / 8) as usize;
+            let mut out = 0u128;
+            for i in 0..bytes {
+                out |= ((bits >> (8 * i)) & 0xff) << (8 * (bytes - 1 - i));
+            }
+            return Some(Konst {
+                v: out as i128,
+                ty: param,
+                hex: true,
+            });
+        }
+    };
+    int(n)
 }
 
 pub fn cond(c: Konst, t: Konst, f: Konst) -> Option<Konst> {
@@ -370,6 +456,39 @@ mod tests {
         assert_eq!(binary("%", int_min, unary("-", k("1")).unwrap()), None);
         assert_eq!(cast(&["int"], k("4294967295U")), None);
         assert_eq!(shown(Some(int_min)), None);
+    }
+
+    #[test]
+    fn builtins_follow_gcc() {
+        let b = |n: &str, v: &str| shown(builtin(n, k(v)));
+        assert_eq!(b("__builtin_clzll", "63UL"), Some("58".into()));
+        assert_eq!(b("__builtin_clz", "1"), Some("31".into()));
+        assert_eq!(
+            b("__builtin_clzl", "0x8000000000000000UL"),
+            Some("0".into())
+        );
+        assert_eq!(b("__builtin_clz", "0"), None);
+        assert_eq!(b("__builtin_ctzl", "0x1000UL"), Some("12".into()));
+        assert_eq!(b("__builtin_ctz", "0"), None);
+        assert_eq!(b("__builtin_popcountll", "0xffULL"), Some("8".into()));
+        assert_eq!(b("__builtin_parity", "7"), Some("1".into()));
+        assert_eq!(b("__builtin_ffs", "0"), Some("0".into()));
+        assert_eq!(b("__builtin_ffs", "8"), Some("4".into()));
+        assert_eq!(b("__builtin_clrsb", "0"), Some("31".into()));
+        assert_eq!(
+            b("__builtin_bswap32", "0x12345678"),
+            Some("0x78563412U".into())
+        );
+        assert_eq!(
+            b("__builtin_bswap64", "1"),
+            Some("0x100000000000000UL".into())
+        );
+        assert_eq!(
+            shown(builtin("__builtin_clz", unary("-", k("1")).unwrap())),
+            Some("0".into())
+        );
+        assert_eq!(b("__builtin_ffs", "4294967295U"), None);
+        assert_eq!(b("__builtin_bswap16", "1"), None);
     }
 
     #[test]

@@ -12,4 +12,5 @@ pub mod store;
 pub mod syntax;
 pub mod timing;
 pub mod tree;
+pub mod types;
 pub mod workspace;

@@ -157,6 +157,84 @@ pub fn headers_defining_undefined(
     wanted
 }
 
+pub fn headers_defining_types(
+    ws: &Workspace,
+    sim: &Sim<'_>,
+    out: &[lex::Token],
+    base: &CompileModel,
+    have: &[String],
+) -> Vec<String> {
+    use super::c_type::{Base, TypeCx, parse_type_name};
+    use crate::types::{DefKind as TypeKind, NameKind};
+    let env = TypeCx::new(ws, sim, false);
+    let toks: Vec<&lex::Token> = out
+        .iter()
+        .filter(|t| t.kind != lex::TokenKind::Placemarker)
+        .collect();
+    let mut wanted: Vec<String> = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    for i in 0..toks.len() {
+        let w = sim.it.get(toks[i].sym);
+        if !(toks[i].kind == lex::TokenKind::Ident
+            && matches!(w, "sizeof" | "__builtin_offsetof")
+            && toks
+                .get(i + 1)
+                .is_some_and(|t| t.is_punct(crate::intern::sym::LPAREN)))
+        {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut words: Vec<&str> = Vec::new();
+        for t in &toks[i + 1..] {
+            if t.is_punct(crate::intern::sym::LPAREN) {
+                depth += 1;
+                if depth == 1 {
+                    continue;
+                }
+            } else if t.is_punct(crate::intern::sym::RPAREN) {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else if depth == 1 && t.is_punct(crate::intern::sym::COMMA) {
+                break;
+            }
+            words.push(sim.it.get(t.sym));
+        }
+        let Some(t) = parse_type_name(&words) else {
+            continue;
+        };
+        let (kind, name) = match t.base {
+            Base::Tag(k, n) => (k, n),
+            Base::Typedef(n) => (TypeKind::Typedef, n),
+            _ => continue,
+        };
+        if !seen.insert((kind as u8, name.to_string())) || env.def_named(kind, name).is_some() {
+            continue;
+        }
+        let Some(table) = env.table() else {
+            return wanted;
+        };
+        let mut files: Vec<&str> = table
+            .named(name)
+            .filter(|(k, _)| *k == NameKind::Def(kind))
+            .filter_map(|(_, i)| table.def(i))
+            .filter(|d| d.size.is_some())
+            .map(|d| d.file)
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        if let [file] = files.as_slice()
+            && let Some(spec) = include_spec(base, &env.abs(file))
+            && !have.contains(&spec)
+            && !wanted.contains(&spec)
+        {
+            wanted.push(spec);
+        }
+    }
+    wanted
+}
+
 pub fn header_contexts(cands: &[Cand], limit: usize) -> Vec<(String, PathBuf)> {
     let mut v: Vec<(String, PathBuf)> = Vec::new();
     for c in cands {

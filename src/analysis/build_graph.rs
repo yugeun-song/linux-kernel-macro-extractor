@@ -326,7 +326,7 @@ impl Workspace {
     }
 }
 
-fn outside_rayon<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+pub(crate) fn outside_rayon<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     if rayon::current_thread_index().is_none() {
         return f();
     }

@@ -80,6 +80,7 @@ pub fn expand_text(ws: &Workspace, text: &str, opts: &ShowOptions) -> Report {
         let refined = b.refine(&out).filter(|r| *r != result);
         report.value = value.clone();
         report.expansion = Some(ExpNode {
+            layout: None,
             target: None,
             name: "input".into(),
             call: text.to_string(),
@@ -163,6 +164,7 @@ pub fn expand_line(
         report.notes.push("no macro is used on this line".into());
     }
     report.expansion = Some(ExpNode {
+        layout: None,
         target: None,
         name: format!("{rel}:{line}"),
         call: text.trim().to_string(),

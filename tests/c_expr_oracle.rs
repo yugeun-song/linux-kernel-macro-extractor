@@ -2,9 +2,49 @@ use std::fmt::Write as _;
 use std::process::Command;
 
 use kmx::analysis::c_expr::simplify;
+use kmx::analysis::c_type::Basic;
 use kmx::intern::Interner;
 use kmx::syntax::lex::lex_all;
 use rustc_hash::FxHashSet;
+
+const LP64: Basic = Basic { lp64: true };
+
+const SIZED: &[&str] = &[
+    "char",
+    "short",
+    "int",
+    "long",
+    "unsigned long long",
+    "_Bool",
+    "void *",
+    "int [3]",
+    "char *[4]",
+    "long (*)[5]",
+    "unsigned short [2][3]",
+    "double",
+    "float",
+];
+
+const BUILTINS: &[&str] = &[
+    "__builtin_clz",
+    "__builtin_clzl",
+    "__builtin_clzll",
+    "__builtin_ctz",
+    "__builtin_ctzl",
+    "__builtin_ctzll",
+    "__builtin_popcount",
+    "__builtin_popcountl",
+    "__builtin_popcountll",
+    "__builtin_parity",
+    "__builtin_parityll",
+    "__builtin_ffs",
+    "__builtin_ffsl",
+    "__builtin_ffsll",
+    "__builtin_clrsb",
+    "__builtin_clrsbll",
+    "__builtin_bswap32",
+    "__builtin_bswap64",
+];
 
 struct Rng(u64);
 
@@ -272,7 +312,7 @@ fn simplified_expressions_compile_to_the_same_tree() {
         } else {
             FxHashSet::default()
         };
-        let simple = simplify(&toks, &it, &known);
+        let simple = simplify(&toks, &it, &known, &LP64);
         if let Some(s) = &simple
             && s != &e
         {
@@ -330,15 +370,22 @@ fn simplified_expressions_compile_to_the_same_tree() {
             .unwrap_or_default()
     };
     let mut bad = Vec::new();
+    let mut chosen = 0;
     for (i, (e, simple)) in cases.iter().enumerate() {
         let (bo, bs) = (body(&format!("o{i}")), body(&format!("s{i}")));
         assert!(!bo.is_empty() && !bs.is_empty(), "no tree for case {i}");
-        if bo != bs {
+        if bo == bs {
+            continue;
+        }
+        if simple.matches('?').count() < e.matches('?').count() {
+            chosen += 1;
+        } else {
             bad.push(format!("{e}  =>  {simple}\n--- o{i}\n{bo}\n--- s{i}\n{bs}"));
         }
     }
     eprintln!(
-        "{count} expressions, {changed} simplified, {total} discarded constants in the trees, {} trees differ",
+        "{count} expressions, {changed} simplified, {total} discarded constants in the trees, \
+         {chosen} constant conditions reduced to one arm (type checked), {} trees differ",
         bad.len()
     );
     assert!(bad.is_empty(), "{}", bad.join("\n"));
@@ -366,7 +413,43 @@ fn constant(r: &mut Rng, depth: u32) -> String {
     if depth == 0 || r.chance(20) {
         return r.pick(LITERALS).to_string();
     }
-    match r.below(10) {
+    match r.below(17) {
+        15 => format!(
+            "({}) ? ({}) : (({})f({}))",
+            r.pick(LITERALS),
+            constant(r, depth - 1),
+            r.pick(CONSTANT_CASTS),
+            r.pick(LITERALS)
+        ),
+        16 => format!(
+            "({}) ? (({})f({})) : ({})",
+            r.pick(LITERALS),
+            r.pick(CONSTANT_CASTS),
+            r.pick(LITERALS),
+            constant(r, depth - 1)
+        ),
+        10 => match r.below(3) {
+            0 => format!("sizeof({})", r.pick(SIZED)),
+            1 => format!("sizeof(({}))", constant(r, depth - 1)),
+            _ => format!(
+                "sizeof(({})({}))",
+                r.pick(CONSTANT_CASTS),
+                constant(r, depth - 1)
+            ),
+        },
+        11 => format!("{}(({}))", r.pick(BUILTINS), constant(r, depth - 1)),
+        12 => format!("__builtin_constant_p(({}))", constant(r, depth - 1)),
+        13 => format!(
+            "__builtin_choose_expr({}, ({}), ({}))",
+            r.pick(LITERALS),
+            constant(r, depth - 1),
+            constant(r, depth - 1)
+        ),
+        14 => format!(
+            "(__typeof__(({})))({})",
+            constant(r, depth - 1),
+            constant(r, depth - 1)
+        ),
         0..=4 => {
             let op = r.pick(CONSTANT_BINARY);
             let (l, rr) = (constant(r, depth - 1), constant(r, depth - 1));
@@ -403,14 +486,15 @@ fn folded_constants_keep_their_value_and_type() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0x9e37_79b9_7f4a_7c15);
     let mut r = Rng(seed.rotate_left(17) | 1);
-    let mut src = String::new();
+    let mut src = String::from("int f(int);\n");
+    let mut run = String::from("int f(int x) { (void)x; __builtin_trap(); }\nint main(void) {\n");
     let (mut whole, mut partial) = (0, 0);
     for i in 0..count {
         let depth = 1 + r.below(5) as u32;
         let e = constant(&mut r, depth);
         let mut it = Interner::new();
         let toks = lex_all(e.as_bytes(), false, &mut it);
-        let Some(folded) = simplify(&toks, &it, &FxHashSet::default()) else {
+        let Some(folded) = simplify(&toks, &it, &FxHashSet::default(), &LP64) else {
             continue;
         };
         let single = lex_all(folded.as_bytes(), false, &mut it);
@@ -420,13 +504,43 @@ fn folded_constants_keep_their_value_and_type() {
             src,
             "_Static_assert(__builtin_types_compatible_p(__typeof__({e}), __typeof__({folded})), \"type {i}\");"
         );
-        if literal {
+        if literal && e.contains("f(") {
+            whole += 1;
+            let _ = writeln!(
+                run,
+                "  if (({e}) != ({folded})) {{ __builtin_printf(\"value %d\\n\", {i}); return 1; }}"
+            );
+        } else if literal {
             whole += 1;
             let _ = writeln!(src, "_Static_assert(({e}) == ({folded}), \"value {i}\");");
         } else {
             partial += 1;
         }
     }
+    run.push_str("  return 0;\n}\n");
+    let dir = std::env::temp_dir().join(format!("kmx-c-const-oracle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("run.c"), &run).unwrap();
+    let built = Command::new("gcc")
+        .args(["-w", "-O0", "-std=gnu11", "-o"])
+        .arg(dir.join("run"))
+        .arg(dir.join("run.c"))
+        .output()
+        .expect("gcc runs");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let ran = Command::new(dir.join("run"))
+        .output()
+        .expect("the check runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ran.status.success(),
+        "runtime check failed: {}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
     let out = Command::new("gcc")
         .args(["-fsyntax-only", "-w", "-std=gnu11", "-x", "c", "-"])
         .stdin(std::process::Stdio::piped())
@@ -448,5 +562,21 @@ fn folded_constants_keep_their_value_and_type() {
         "{count} constant expressions: {whole} folded to one literal, {partial} folded in part, {} gcc errors",
         errors.matches("error:").count()
     );
-    assert!(out.status.success(), "{errors}");
+    if !out.status.success() {
+        let lines: Vec<&str> = src.lines().collect();
+        let shown: Vec<String> = errors
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("<stdin>:")?
+                    .split(':')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .take(6)
+            .filter_map(|n| lines.get(n - 1).map(|l| l.to_string()))
+            .collect();
+        panic!("{errors}\n{}", shown.join("\n"));
+    }
 }
+

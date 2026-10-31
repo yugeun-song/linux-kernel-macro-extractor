@@ -116,6 +116,10 @@ impl Writer {
     }
 
     pub fn finish(self, out: &mut impl Write) -> io::Result<u64> {
+        self.finish_as(MAGIC, crate::store::FORMAT_VERSION, out)
+    }
+
+    pub fn finish_as(self, magic: &[u8; 8], version: u32, out: &mut impl Write) -> io::Result<u64> {
         let header_len = 8 + 4 + 4 + self.sections.len() * 20;
         let mut offset = align8(header_len as u64);
         let mut table = Vec::with_capacity(self.sections.len());
@@ -124,8 +128,8 @@ impl Writer {
             offset = align8(offset + data.len() as u64);
         }
         let mut head = Vec::with_capacity(header_len);
-        head.extend_from_slice(MAGIC);
-        head.extend_from_slice(&crate::store::FORMAT_VERSION.to_le_bytes());
+        head.extend_from_slice(magic);
+        head.extend_from_slice(&version.to_le_bytes());
         head.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
         for (tag, off, len) in &table {
             head.extend_from_slice(&tag.0);
@@ -190,10 +194,11 @@ pub struct Sections<'a> {
 
 impl<'a> Sections<'a> {
     pub fn parse(data: &'a [u8]) -> Option<Sections<'a>> {
-        if data.len() < 16 || &data[..8] != MAGIC {
-            return None;
-        }
-        if rd_u32(data, 8) != crate::store::FORMAT_VERSION {
+        Sections::parse_as(data, MAGIC, crate::store::FORMAT_VERSION)
+    }
+
+    pub fn parse_as(data: &'a [u8], magic: &[u8; 8], version: u32) -> Option<Sections<'a>> {
+        if data.len() < 16 || &data[..8] != magic || rd_u32(data, 8) != version {
             return None;
         }
         let n = rd_u32(data, 12) as usize;

@@ -1,8 +1,11 @@
 use rustc_hash::FxHashMap;
 
+use super::c_type::{self, Base, Step, TypeCx, TypeEnv};
 use super::candidates::{self, Cand, Reach};
 use super::explain;
-use super::report::{Arg, CTarget, Candidate, Condition, ExpNode, Site, Value};
+use super::report::{
+    Arg, CTarget, Candidate, Condition, ExpNode, LayoutMember, Site, TypeLayout, Value,
+};
 use super::value::{self, Evaluated, ValueCtx};
 use crate::intern::{Interner, Sym, sym};
 use crate::pp::expand::Trace;
@@ -44,6 +47,10 @@ fn expand_tabs(line: &str) -> String {
     out
 }
 
+pub fn char_unsigned(ws: &Workspace, model: &CompileModel) -> bool {
+    model.flags.iter().any(|f| f == "-funsigned-char") || ws.target.arch.srcarch() != "x86"
+}
+
 pub struct Builder<'a, 'w> {
     pub sim: &'a mut Sim<'w>,
     pub ws: &'w Workspace,
@@ -51,6 +58,7 @@ pub struct Builder<'a, 'w> {
     pub opts: &'a TreeOpts,
     pub char_unsigned: bool,
     seen: FxHashMap<String, String>,
+    shown_types: rustc_hash::FxHashSet<String>,
     alt_cache: FxHashMap<Sym, Vec<Candidate>>,
     targets: rustc_hash::FxHashSet<Sym>,
     known: FxHashMap<Sym, Sym>,
@@ -77,8 +85,7 @@ impl<'a, 'w> Builder<'a, 'w> {
         model: &'a CompileModel,
         opts: &'a TreeOpts,
     ) -> Self {
-        let char_unsigned =
-            model.flags.iter().any(|f| f == "-funsigned-char") || ws.target.arch.srcarch() != "x86";
+        let char_unsigned = char_unsigned(ws, model);
         Builder {
             sim,
             ws,
@@ -86,6 +93,7 @@ impl<'a, 'w> Builder<'a, 'w> {
             opts,
             char_unsigned,
             seen: FxHashMap::default(),
+            shown_types: rustc_hash::FxHashSet::default(),
             alt_cache: FxHashMap::default(),
             targets: rustc_hash::FxHashSet::default(),
             known: FxHashMap::default(),
@@ -161,8 +169,17 @@ impl<'a, 'w> Builder<'a, 'w> {
         }
     }
 
+    pub fn types(&self) -> TypeCx<'_, 'w> {
+        TypeCx::new(self.ws, &*self.sim, self.char_unsigned)
+    }
+
+    pub fn bind(&mut self, names: impl IntoIterator<Item = Sym>) {
+        self.vars.extend(names);
+    }
+
     pub fn refine(&self, toks: &[Token]) -> Option<String> {
-        super::c_expr::simplify(toks, &self.sim.it, &self.vars).map(clip)
+        let env = self.types();
+        super::c_expr::simplify(toks, &self.sim.it, &self.vars, &env).map(clip)
     }
 
     pub fn value_of(&self, toks: &[Token]) -> Option<Value> {
@@ -188,6 +205,19 @@ impl<'a, 'w> Builder<'a, 'w> {
         } else {
             toks
         };
+        let env = self.types();
+        if let Some(k) = super::c_expr::evaluate(toks, &self.sim.it, &self.vars, &env) {
+            let v = value::CVal {
+                v: k.v,
+                ty: k.ty,
+                pointer: false,
+            };
+            let (display, ty) = value::display(&v, self.char_unsigned);
+            return Some(Value {
+                display,
+                ty: Some(ty),
+            });
+        }
         let cx = ValueCtx {
             it: &self.sim.it,
             config: &self.ws.config,
@@ -291,6 +321,7 @@ impl<'a, 'w> Builder<'a, 'w> {
         let site = def.as_ref().and_then(|d| self.site_of(d));
         if let Some(first) = self.seen.get(&key) {
             return ExpNode {
+                layout: None,
                 name,
                 call,
                 site,
@@ -348,10 +379,13 @@ impl<'a, 'w> Builder<'a, 'w> {
             }
             Vec::new()
         } else {
-            n.children
+            let mut kids: Vec<ExpNode> = n
+                .children
                 .iter()
                 .map(|&c| self.node(trace, c, depth + 1))
-                .collect()
+                .collect();
+            kids.extend(self.evidence(&n));
+            kids
         };
         let names_itself = result_tokens
             .iter()
@@ -387,6 +421,7 @@ impl<'a, 'w> Builder<'a, 'w> {
             note = Some("__COUNTER__/__LINE__/__FILE__ are kept by name: their value depends on where the macro is used".into());
         }
         ExpNode {
+            layout: None,
             name,
             call,
             site,
@@ -467,7 +502,8 @@ impl<'a, 'w> Builder<'a, 'w> {
                 && !truncated
                 && let Some(expr) = single_return(&out, &self.sim.it)
             {
-                returns = super::c_expr::simplify(expr, &self.sim.it, &vars)
+                let env = self.types();
+                returns = super::c_expr::simplify(expr, &self.sim.it, &vars, &env)
                     .or_else(|| Some(lex::render(expr, &self.sim.it)));
             }
             if let Some(trace) = trace
@@ -484,6 +520,7 @@ impl<'a, 'w> Builder<'a, 'w> {
             }
         }
         Some(ExpNode {
+            layout: None,
             name: name.clone(),
             call: format!("{name}()"),
             site: Some(Site {
@@ -545,6 +582,7 @@ impl<'a, 'w> Builder<'a, 'w> {
             self.known.insert(sym, number);
         }
         Some(ExpNode {
+            layout: None,
             name: name.to_string(),
             call: name.to_string(),
             site: Some(Site {
@@ -569,6 +607,420 @@ impl<'a, 'w> Builder<'a, 'w> {
                 kind: match &info.tag {
                     Some(t) => format!("enum constant of enum {t}"),
                     None => "enum constant".to_string(),
+                },
+                lines: Vec::new(),
+                hidden: 0,
+                params: Vec::new(),
+                returns: None,
+            }),
+        })
+    }
+}
+
+const LAYOUT_LINES: usize = 20;
+
+enum Operand {
+    Size(Vec<Token>, String),
+    Offset(Vec<Token>, Vec<Token>, String),
+    Enum(Sym),
+}
+
+fn group_end(toks: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, t) in toks.iter().enumerate().skip(open) {
+        if t.is_punct(sym::LPAREN) {
+            depth += 1;
+        } else if t.is_punct(sym::RPAREN) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn top_comma(toks: &[Token]) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, t) in toks.iter().enumerate() {
+        if t.is_punct(sym::LPAREN) || t.is_punct(sym::LBRACKET) {
+            depth += 1;
+        } else if t.is_punct(sym::RPAREN) || t.is_punct(sym::RBRACKET) {
+            depth -= 1;
+        } else if depth == 0 && t.is_punct(sym::COMMA) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn designator<'t>(words: &[&'t str]) -> Option<Vec<Step<'t>>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut first = true;
+    while i < words.len() {
+        match words[i] {
+            "." if !first => {
+                out.push(Step::Field(words.get(i + 1)?));
+                i += 2;
+            }
+            "[" => {
+                let k = super::c_const::literal(words.get(i + 1)?)?;
+                if words.get(i + 2) != Some(&"]") {
+                    return None;
+                }
+                out.push(Step::Index(u64::try_from(k.v).ok()?));
+                i += 3;
+            }
+            w if first => {
+                out.push(Step::Field(w));
+                i += 1;
+            }
+            _ => return None,
+        }
+        first = false;
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+impl Builder<'_, '_> {
+    fn operands(&self, toks: &[Token]) -> Vec<(String, Operand)> {
+        let it = &self.sim.it;
+        let toks: Vec<Token> = toks
+            .iter()
+            .filter(|t| t.kind != TokenKind::Placemarker)
+            .copied()
+            .collect();
+        let mut out: Vec<(String, Operand)> = Vec::new();
+        let mut enums = rustc_hash::FxHashSet::default();
+        let mut i = 0;
+        while i < toks.len() {
+            let t = toks[i];
+            if t.kind != TokenKind::Ident {
+                i += 1;
+                continue;
+            }
+            let w = it.get(t.sym);
+            if matches!(w, "sizeof" | "__builtin_offsetof")
+                && toks.get(i + 1).is_some_and(|n| n.is_punct(sym::LPAREN))
+                && let Some(end) = group_end(&toks, i + 1)
+            {
+                let inner = toks[i + 2..end].to_vec();
+                let text = lex::render(&inner, it);
+                let spelled = lex::render(&toks[i..=end], it);
+                if w == "sizeof" {
+                    out.push((format!("s:{text}"), Operand::Size(inner, spelled)));
+                } else if let Some(c) = top_comma(&inner) {
+                    out.push((
+                        format!("o:{text}"),
+                        Operand::Offset(inner[..c].to_vec(), inner[c + 1..].to_vec(), spelled),
+                    ));
+                }
+                i = end + 1;
+                continue;
+            }
+            if !self.vars.contains(&t.sym)
+                && enums.insert(t.sym)
+                && self
+                    .ws
+                    .index
+                    .lookup(w)
+                    .iter()
+                    .any(|p| p.kind == crate::index::DefKind::Enumerator)
+            {
+                out.push((format!("e:{w}"), Operand::Enum(t.sym)));
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn evidence(&mut self, n: &crate::pp::expand::Node) -> Vec<ExpNode> {
+        let from_args: rustc_hash::FxHashSet<String> = n
+            .args
+            .iter()
+            .flat_map(|a| self.operands(a))
+            .map(|(k, _)| k)
+            .collect();
+        let mut out = Vec::new();
+        for (key, op) in self.operands(&n.substituted) {
+            if from_args.contains(&key) || self.shown_types.contains(&key) {
+                continue;
+            }
+            let node = match op {
+                Operand::Size(t, spelled) => self.size_node(&t, spelled),
+                Operand::Offset(t, d, spelled) => self.offset_node(&t, &d, spelled),
+                Operand::Enum(s) if s != n.sym => self.enum_node(s),
+                Operand::Enum(_) => None,
+            };
+            if let Some(node) = node {
+                self.shown_types.insert(key);
+                out.push(node);
+            }
+        }
+        out
+    }
+
+    fn type_site(&self, d: &crate::types::DefView<'_>, table: &crate::types::Table) -> Site {
+        let env = self.types();
+        let abs = env.abs(d.file);
+        let path = match self.sim.files.lookup(&abs) {
+            Some(f) => self.sim.files.display(f).to_string(),
+            None => self.ws.locator().display_for(&abs),
+        };
+        let text = match d.kind {
+            crate::types::DefKind::Typedef => {
+                format!("typedef {}", c_type::declaration(table, d.target, d.name))
+            }
+            k if d.name.is_empty() => format!("{} {{...}}", k.keyword()),
+            k => format!("{} {}", k.keyword(), d.name),
+        };
+        Site {
+            path,
+            line: d.line,
+            text,
+            origin: "type".into(),
+        }
+    }
+
+    fn layout_of(&self, d: &crate::types::DefView<'_>, table: &crate::types::Table) -> TypeLayout {
+        let env = self.types();
+        let agg = match d.kind {
+            crate::types::DefKind::Typedef if d.types_agree() => env.aggregate(table, d.target, 0),
+            crate::types::DefKind::Typedef => None,
+            _ => Some(*d),
+        };
+        let mut members = Vec::new();
+        let mut total = 0usize;
+        let limit = if self.opts.full_bodies {
+            usize::MAX
+        } else {
+            LAYOUT_LINES
+        };
+        if let Some(a) = agg {
+            match a.kind {
+                crate::types::DefKind::Enum => {
+                    for e in table.enumerators(&a) {
+                        total += 1;
+                        if members.len() < limit {
+                            members.push(LayoutMember {
+                                offset: String::new(),
+                                size: String::new(),
+                                decl: format!("{} = {}", e.name, e.value),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    let typed = a.types_agree();
+                    for m in table.members(&a) {
+                        total += 1;
+                        if members.len() >= limit {
+                            continue;
+                        }
+                        let (offset, size) = if m.bit_size > 0 {
+                            (
+                                m.bit_offset
+                                    .map_or("?".into(), |b| format!("{}:{}", b / 8, b % 8)),
+                                format!(
+                                    "{} bit{}",
+                                    m.bit_size,
+                                    if m.bit_size == 1 { "" } else { "s" }
+                                ),
+                            )
+                        } else {
+                            (
+                                m.offset.map_or("?".into(), |o| o.to_string()),
+                                m.size.map_or("-".into(), |s| s.to_string()),
+                            )
+                        };
+                        let decl = if typed {
+                            c_type::declaration(table, m.ty, m.name)
+                        } else {
+                            m.name.to_string()
+                        };
+                        members.push(LayoutMember { offset, size, decl });
+                    }
+                }
+            }
+        }
+        let mut source = format!(
+            "DWARF of this build: the same in {} compile unit{}",
+            d.cus,
+            if d.cus == 1 { "" } else { "s" }
+        );
+        if agg.is_some_and(|a| !a.types_agree()) {
+            source.push_str("; member types differ between compile units, so only names are shown");
+        }
+        TypeLayout {
+            size: d.size,
+            hidden: total - members.len(),
+            members,
+            source,
+        }
+    }
+
+    fn size_value(&self, v: u64) -> Value {
+        let (display, ty) = value::display(
+            &value::CVal {
+                v: i128::from(v),
+                ty: value::IntTy::ULong,
+                pointer: false,
+            },
+            self.char_unsigned,
+        );
+        Value {
+            display,
+            ty: Some(ty),
+        }
+    }
+
+    fn type_node(
+        &self,
+        call: String,
+        v: u64,
+        d: &crate::types::DefView<'_>,
+        table: &crate::types::Table,
+    ) -> ExpNode {
+        ExpNode {
+            layout: Some(self.layout_of(d, table)),
+            name: call.clone(),
+            call,
+            site: Some(self.type_site(d, table)),
+            why: Vec::new(),
+            alternatives: Vec::new(),
+            args: Vec::new(),
+            substituted: String::new(),
+            result: v.to_string(),
+            refined: None,
+            value: Some(self.size_value(v)),
+            children: Vec::new(),
+            note: None,
+            repeat_of: None,
+            config: None,
+            kconfig: None,
+            target: None,
+        }
+    }
+
+    fn size_node(&self, toks: &[Token], spelled: String) -> Option<ExpNode> {
+        let it = &self.sim.it;
+        let words: Vec<&str> = toks.iter().map(|t| it.get(t.sym)).collect();
+        let t = c_type::parse_type_name(&words)?;
+        if t.ops
+            .iter()
+            .any(|o| !matches!(o, c_type::Op::Array(Some(_))))
+        {
+            return None;
+        }
+        let (kind, name) = match t.base {
+            Base::Tag(k, n) => (k, n),
+            Base::Typedef(n) if !self.vars.iter().any(|v| it.get(*v) == n) => {
+                (crate::types::DefKind::Typedef, n)
+            }
+            _ => return None,
+        };
+        let env = self.types();
+        let size = env.size_of(&t, None)?;
+        let d = env.def_named(kind, name)?;
+        let table = env.table()?;
+        Some(self.type_node(spelled, size, &d, table))
+    }
+
+    fn offset_node(&self, ty: &[Token], desig: &[Token], spelled: String) -> Option<ExpNode> {
+        let it = &self.sim.it;
+        let words: Vec<&str> = ty.iter().map(|t| it.get(t.sym)).collect();
+        let t = c_type::parse_type_name(&words)?;
+        if !t.ops.is_empty() {
+            return None;
+        }
+        let (kind, name) = match t.base {
+            Base::Tag(k, n) => (k, n),
+            Base::Typedef(n) => (crate::types::DefKind::Typedef, n),
+            _ => return None,
+        };
+        let dwords: Vec<&str> = desig.iter().map(|t| it.get(t.sym)).collect();
+        let path = designator(&dwords)?;
+        let env = self.types();
+        let (off, _) = env.offset(&t.base, &path)?;
+        let d = env.def_named(kind, name)?;
+        let table = env.table()?;
+        Some(self.type_node(spelled, off, &d, table))
+    }
+
+    fn enum_node(&self, s: Sym) -> Option<ExpNode> {
+        let it = &self.sim.it;
+        let name = it.get(s);
+        let env = self.types();
+        let (def, value) = env.enumerator_at(name)?;
+        let table = env.table()?;
+        let d = table.def(def)?;
+        let abs = env.abs(d.file);
+        let f = self.sim.files.lookup(&abs)?;
+        let path = self.sim.files.display(f).to_string();
+        let line = self
+            .ws
+            .index
+            .lookup(name)
+            .iter()
+            .filter(|p| p.kind == crate::index::DefKind::Enumerator && p.line >= d.line)
+            .filter(|p| {
+                self.ws
+                    .index
+                    .file(p.file)
+                    .is_some_and(|v| crate::pp::kbuild::normalize(&self.ws.abs(&v)) == abs)
+            })
+            .map(|p| p.line)
+            .min()?;
+        let content = self.sim.files.content(f);
+        let text = (line as usize)
+            .checked_sub(1)
+            .and_then(|i| {
+                String::from_utf8_lossy(&content)
+                    .lines()
+                    .nth(i)
+                    .map(str::to_string)
+            })
+            .map(|l| l.trim().trim_end_matches(',').to_string())
+            .unwrap_or_else(|| name.to_string());
+        let shown = value::display(
+            &value::CVal {
+                v: value,
+                ty: value::IntTy::Int,
+                pointer: false,
+            },
+            self.char_unsigned,
+        );
+        Some(ExpNode {
+            layout: None,
+            name: name.to_string(),
+            call: name.to_string(),
+            site: Some(Site {
+                path,
+                line,
+                text,
+                origin: "enum".into(),
+            }),
+            why: Vec::new(),
+            alternatives: Vec::new(),
+            args: Vec::new(),
+            substituted: String::new(),
+            result: value.to_string(),
+            refined: None,
+            value: Some(Value {
+                display: shown.0,
+                ty: Some(shown.1),
+            }),
+            children: Vec::new(),
+            note: None,
+            repeat_of: None,
+            config: None,
+            kconfig: None,
+            target: Some(CTarget {
+                kind: if d.name.is_empty() {
+                    "enum constant".to_string()
+                } else {
+                    format!("enum constant of enum {}", d.name)
                 },
                 lines: Vec::new(),
                 hidden: 0,

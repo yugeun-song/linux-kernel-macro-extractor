@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use kmx::workspace::{OpenOptions, Workspace};
 
+#[allow(dead_code)]
 #[path = "../tests/support/oracle.rs"]
 mod oracle;
 

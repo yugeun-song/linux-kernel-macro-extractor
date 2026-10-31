@@ -99,7 +99,8 @@ pub fn run(cli: Cli) -> Result<i32> {
     };
     let open = || -> Result<&'static Workspace> {
         let (tree, opts) = target()?;
-        let ws = Workspace::open(&tree, &opts, &mut |m: &str| ctx.notify(m))?;
+        let mut ws = Workspace::open(&tree, &opts, &mut |m: &str| ctx.notify(m))?;
+        ws.quiet = ctx.quiet;
         crate::render::paths::configure(
             &tree,
             &ws.layout.srctree,

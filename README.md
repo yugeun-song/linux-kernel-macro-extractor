@@ -39,6 +39,24 @@ Results are cleaned up only by rewrites that hold for every C expression:
   hexadecimal operands is written in hexadecimal. Nothing is folded when the
   operation is undefined or implementation-defined, such as signed overflow, a
   shift by the width of the type, or a right shift of a negative value.
+- `sizeof` and `offsetof` of a kernel type become numbers when the build can
+  answer them exactly (see [Types from the build](#types-from-the-build)):
+  `PAGE_SIZE / sizeof (struct mem_section)` becomes `0x100UL`, so
+  `NR_SECTION_ROOTS` on 4.6 arm64 ends as `1024`. Basic types and pointers
+  fold from the 64-bit data model, `sizeof` of an expression folds when its
+  type is certain, and `typeof` of such an expression works in a cast.
+- `__builtin_constant_p(e)` becomes `1` only when `e` is a constant expression
+  with no call anywhere in it, because GCC answers 0 or defers for anything
+  else; `__builtin_choose_expr` picks its operand under the same condition.
+  `__builtin_clz`, `ctz`, `popcount`, `parity`, `ffs`, `clrsb` and `bswap32/64`
+  fold with GCC's argument conversions, and `clz` or `ctz` of zero, which is
+  undefined, stays as written.
+- A conditional with a constant condition keeps only the operand it selects,
+  converted to the type both operands share, once both types are certain: a
+  call's type comes from the declaration the build compiled. So
+  `order_base_2(sizeof(struct page))` on 6.18 arm64 ends as `6`.
+- An enum constant in an expression becomes its value when the build's DWARF
+  holds its enum, the enum is visible in the context, and the value fits `int`.
 - A cast repeated on its own result is written once:
   `(unsigned long)(unsigned long)address` becomes `(unsigned long)address`, as
   in riscv64's `virt_to_phys`, whose `__pa()` casts what it already cast.
@@ -51,6 +69,20 @@ Results are cleaned up only by rewrites that hold for every C expression:
   `({ VM_BUG_ON(x); y; })` reads `({ y; })`. The last statement is the value
   and stays; `({ y; })` is not reduced to `y`, because the two differ as
   lvalues and in constant expressions.
+
+A `sizeof` or `offsetof` that was resolved gets its own node under the macro
+that wrote it: the value, the definition of the type with its location, and its
+members with offset and size, 20 of them unless `--all` is given. An enum
+constant that was replaced gets a node with its definition.
+
+```
+└─ sizeof (struct mem_section) = 16 (0x10)
+     struct mem_section            kernel/include/linux/mmzone.h:1040
+     offset  size  member
+          0     8  unsigned long section_mem_map
+          8     8  unsigned long *pageblock_flags
+     (DWARF of this build: the same in 3 compile units)
+```
 
 C code longer than 80 columns, or than the terminal when it is narrower, is
 broken in kernel style: eight-column indents, the statements of a statement
@@ -236,7 +268,7 @@ kmx rm 2c2efcc13985                           delete one index, by ID prefix or 
 | `grep PATTERN [-w] [-g]` | Print every definition of the matching names, one line each, with its status in this configuration: `path:line: definition  [status]`. PATTERN is a regular expression matched anywhere in a name, as in rg; `-w` matches whole names and `-g` takes a glob. |
 | `uses NAME` | Print the definitions whose body uses NAME, with their status in this configuration. |
 | `dump [--format tsv\|json]` | Dump every macro active in a context. Needs `--in` or `--include`. |
-| `index` | Rebuild this tree's index from scratch. |
+| `index` | Rebuild this tree's index from scratch and read the C types from the build's DWARF, so that no later query waits for them. Build scripts call it after a kernel build. |
 | `ls` | List every indexed tree: ID, kernel, commit, content hash, architecture, state, age, size and path. No `TREE`. |
 | `rm ID\|TREE...` | Delete the index of these trees, named by an ID prefix (from `ls`) or a tree path. No `TREE`. |
 | `prune` | Delete the indexes whose tree or build directory is gone, that are no longer a kernel tree, or that are incomplete. No `TREE`. |
@@ -258,7 +290,7 @@ kmx rm 2c2efcc13985                           delete one index, by ID prefix or 
 | `--all` | Show every candidate, every census variant and whole function bodies. |
 | `--scope kernel\|all` | Which definitions count as candidates: the kernel proper for every architecture (default), or also `tools/`, `scripts/`, `Documentation/` and `usr/`. Definitions for other architectures stay listed as losing candidates, because `.config` fixes the architecture. |
 | `-b, --brief` | Print only the conclusion: the first line of the tree output, cleaned up and wrapped the same way, one per name. |
-| `--json` | JSON Lines: one object per result. Expansion nodes and arguments carry `refined`, the cleaned-up result, when it differs from the raw expansion. |
+| `--json` | JSON Lines: one object per result. Expansion nodes and arguments carry `refined`, the cleaned-up result, when it differs from the raw expansion, and the nodes of a resolved `sizeof` or `offsetof` carry `layout`, the type's size and members. |
 | `--vimgrep` | Print `grep`, `uses` and `list` results as `path:line:column:text`, for editor quickfix lists. |
 | `--color auto\|always\|never` | `auto` colors only when stdout is a terminal and honors `NO_COLOR` and `CLICOLOR_FORCE`. |
 | `--pager` | Page output through `$KMX_PAGER`, `$PAGER` or `less -FRX` when stdout is a terminal. |
@@ -486,6 +518,34 @@ order, and lists the members that conditions excluded, with those conditions.
 | `render` | terminal output: tree, steps, sections, tables, sizes and times, paths |
 | `cli`, `cmd` | argument parsing and one module per command family |
 
+## Types from the build
+
+The compiler records the size and layout of every type it uses in the DWARF of
+`vmlinux` and of each module. kmx reads that DWARF from `vmlinux` and from every
+module listed in `modules.order`, once per build, and keeps a compact table of
+structures, unions, enums, typedefs, functions and variables keyed by name and
+declaration line. A query reads the table from disk; the first query after a
+build that needs it reads the DWARF first, which takes a few seconds, unless
+`kmx TREE index` already did (kbuildlab's `tags` command runs it, and
+`kbuildlab update` runs `tags` after building).
+
+An answer is given only when it is certain:
+
+- The type must be visible where the macro is expanded: its definition is in a
+  file of the context, on a line no `#if` excluded. When the header that defines
+  it is not part of the context and only one header defines that name, kmx
+  includes it, as it does for headers that define the macros used, and says so
+  after the tree.
+- A definition must have the same size in every compile unit that uses it, and
+  the same members for `offsetof`. Some headers are compiled twice with different
+  macros, such as `fs/binfmt_elf.c` through `compat_binfmt_elf.c`; such types
+  stay unresolved.
+- The build must be newer than the sources. When a tracked source file or
+  `.config` is newer than `vmlinux`, nothing is answered and the note after the
+  tree names the file; a module older than the newest source is left out.
+- Types that no compiled unit used are not in the DWARF, and `__alignof__` is
+  never folded, because DWARF does not record whether a type is packed.
+
 ## Index and data store
 
 The data directory is `$KMX_HOME`, else `$XDG_DATA_HOME/kmx`, else
@@ -511,8 +571,8 @@ hash of `.config`.
 
 Results are memoized per index state and build, so repeating a query takes
 about 15 ms; relinking `vmlinux` or rewriting `modules.order` starts afresh.
-Analysis caches (Kconfig, build graph, compiler answers) are kept next to the
-index and replaced when what they depend on changes.
+Analysis caches (Kconfig, build graph, compiler answers, the type table) are
+kept next to the index and replaced when what they depend on changes.
 
 `kmx ls` lists every project, much like `docker images`:
 
@@ -616,6 +676,15 @@ For 4.6 arm64, which predates `vmlinux.a`, the census TU list matched the
 compile units recorded in `vmlinux`'s DWARF, apart from the `lib.a` members
 described under Limitations.
 
+The type table was compared with `pahole` over `vmlinux` and every module of
+4.6 arm64, 6.18 and mainline for all three architectures: every structure and
+union size agreed (8,966 to 34,026 per tree), and so did samples of sizes,
+member offsets and enum values printed by gdb. For the same seven trees, the
+values kmx gives for the object-like macros of 14 headers each (548 to 691 per
+tree, about 260 of them through `sizeof`, `offsetof` or builtins) were checked
+with `_Static_assert` by the kernel's compiler with the build's own flags; none
+differed.
+
 ## Tests
 
 `cargo test` runs the unit tests and the command-line tests. The command-line
@@ -658,21 +727,42 @@ The cleanup of results has its own oracle. It needs only the host gcc:
 KMX_C_EXPR_ORACLE=5000 KMX_C_EXPR_SEED=11 cargo test --release --test c_expr_oracle
 ```
 
-It generates random C expressions with casts, typedef names, calls, member
+The type table and the values that depend on it have two more oracles for a
+built tree:
+
+```
+KMX_TYPES_ORACLE=~/src/linux cargo test --release --test types_oracle
+KMX_VALUE_ORACLE=~/src/linux cargo test --release --test value_oracle
+```
+
+`types_oracle` compares every structure and union size in the table with
+`pahole` over `vmlinux` and each module (`KMX_ORACLE_JOBS` runs several at
+once), and samples of sizes, member offsets and enum values with gdb.
+`value_oracle` asks kmx for the value of every object-like macro defined in a
+list of headers (`KMX_VALUE_HEADERS` overrides it), then compiles the same
+context with the flags of `init/main.c` and one `_Static_assert` per value and
+per type; a deliberately wrong value must be rejected first.
+
+The cleanup oracle generates random C expressions with casts, typedef names, calls, member
 access, `sizeof`, statement expressions with declarations and dead statements,
 integer literals with every suffix, and redundant parentheses, cleans each one
 up, and compiles both versions with `gcc -fdump-tree-original`. Every pair must
 produce the same tree once the lines that only discard an integer constant,
 such as `(void) 8;`, are set aside, and `__builtin_types_compatible_p` must
-accept both types. A second test folds random constant expressions and checks
-with `_Static_assert` that each folded literal keeps the type and, when the
-whole expression became one literal, the value.
+accept both types; where kmx reduced a conditional with a constant condition to
+one operand, which GCC keeps in that dump, the type check stands for the tree. A
+second test folds random constant expressions, including `sizeof`, `typeof`
+casts, the builtins above and conditionals with a call in one operand, and
+checks with `_Static_assert` that each folded literal keeps the type and, when
+the whole expression became one literal, the value. Values whose expression
+holds a call are checked by running a program in which that function traps.
 
 ## Limitations
 
 - Only 64-bit x86_64, arm64 and riscv64 kernels are supported.
 - kmx works on the directive level. It evaluates integer expressions and enum
-  bodies, but it does not parse C declarations or types beyond that.
+  bodies; C types come only from the build's DWARF, so a tree that was not built,
+  or was edited since, keeps its `sizeof` and `offsetof` as written.
 - `__COUNTER__`, `__LINE__` and `__FILE__` stay symbolic in analysis output,
   because their values depend on the position of each use.
 - The census splits variants by `MODULE` only. Other per-object Kbuild symbols
@@ -690,8 +780,8 @@ whole expression became one literal, the value.
 - A self-named macro is followed into a C function only when the function is
   written out in a header or source file of the context. A function that another
   macro generates is reported as not found, and K&R-style definitions are not
-  recognized. Enum constants take part in values only when kmx reaches them
-  through a self-named macro.
+  recognized. Enum constants take part in values when the build's DWARF holds
+  their enum, or when kmx reaches them through a self-named macro.
 
 ## License
 

@@ -116,11 +116,25 @@ impl<'w> Oracle<'w> {
             }
             i += 1;
         }
+        let recorded = argv.first()?.clone();
+        let runnable = |c: &str| {
+            Command::new(c)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let compiler = if runnable(&recorded) {
+            recorded
+        } else {
+            bin.clone().filter(|b| runnable(b)).unwrap_or(recorded)
+        };
         Some(Oracle {
             ws,
             rel: rel.to_string(),
             model,
-            compiler: argv.first()?.clone(),
+            compiler,
             args,
         })
     }
@@ -193,6 +207,33 @@ impl<'w> Oracle<'w> {
             gcc_status: out.status.to_string(),
         };
         (check, sim)
+    }
+
+    pub fn check(&self, source: &str) -> (bool, String) {
+        let mut child = Command::new(&self.compiler)
+            .args(
+                self.args
+                    .iter()
+                    .filter(|x| !x.ends_with(".c") && !x.ends_with(".S")),
+            )
+            .args(["-fsyntax-only", "-fmax-errors=0", "-x", "c", "-"])
+            .current_dir(&self.ws.layout.objtree)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the kernel compiler");
+        child
+            .stdin
+            .take()
+            .expect("compiler stdin")
+            .write_all(source.as_bytes())
+            .expect("write the probe file");
+        let out = child.wait_with_output().expect("compiler output");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     }
 
     pub fn expansions(&self, sim: &mut Sim<'w>) -> ExpansionCheck {

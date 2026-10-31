@@ -2,6 +2,7 @@ pub mod build_graph;
 pub mod c_const;
 pub mod c_expr;
 pub mod c_func;
+pub mod c_type;
 pub mod candidates;
 pub mod census;
 pub mod context;

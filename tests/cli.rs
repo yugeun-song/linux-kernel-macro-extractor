@@ -1172,3 +1172,109 @@ fn indexes_survive_reinstalls_and_older_manifests() {
         "a copied binary must reuse the memo of the same build"
     );
 }
+
+#[test]
+fn sizeof_and_offsetof_resolve_from_the_build_dwarf() {
+    let Some(f) = Fixture::new() else { return };
+    let cc_ok = Command::new("gcc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !cc_ok {
+        eprintln!("gcc is not available; skipping");
+        return;
+    }
+    write(
+        &f.tree.join("include/linux/sized.h"),
+        "#ifndef _LINUX_SIZED_H\n#define _LINUX_SIZED_H\n#include <linux/foo.h>\n\
+         struct sized {\n\tunsigned long a;\n\tunsigned int b[3];\n\tenum foo_slot slot;\n};\n\
+         typedef struct sized sized_t;\n\
+         #define SIZED_BYTES (sizeof(struct sized) * 2)\n\
+         #define SIZED_B_OFF __builtin_offsetof(struct sized, b[1])\n\
+         #define SIZED_SLOTS (FOO_D + 1)\n\
+         #define SIZED_T_BYTES sizeof(sized_t)\n\
+         #define SIZED_LONGS (sizeof(sized_t) / sizeof(long))\n\
+         #endif\n",
+    );
+    f.commit("add a sized type");
+    let out = f.stdout(&["SIZED_BYTES"]);
+    assert!(conclusion(&out).contains("sizeof"), "{out}");
+    assert!(out.contains("the tree has no vmlinux"), "{out}");
+    let probe = f.root.join("probe.c");
+    write(
+        &probe,
+        "#include <linux/sized.h>\nstruct sized sized_instance;\nsized_t typed_instance;\n",
+    );
+    let built = Command::new("gcc")
+        .current_dir(&f.tree)
+        .args([
+            "-g",
+            "-O0",
+            "-DCONFIG_BAR=1",
+            "-Iinclude",
+            "-c",
+            "-o",
+            "vmlinux",
+        ])
+        .arg(&probe)
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let brief = f.stdout(&[
+        "-b",
+        "SIZED_BYTES",
+        "SIZED_B_OFF",
+        "SIZED_SLOTS",
+        "SIZED_T_BYTES",
+        "SIZED_LONGS",
+    ]);
+    let lines: Vec<&str> = brief.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "SIZED_BYTES = 48 (0x30)  unsigned long",
+            "SIZED_B_OFF = 12 (0xc)  unsigned long",
+            "SIZED_SLOTS = 12 (0xc)  int",
+            "SIZED_T_BYTES = 24 (0x18)  unsigned long",
+            "SIZED_LONGS = 3  unsigned long",
+        ],
+        "{brief}"
+    );
+    let tree = f.stdout(&["SIZED_BYTES"]);
+    for want in [
+        "sizeof(struct sized) = 24",
+        "struct sized",
+        "include/linux/sized.h:4",
+        "unsigned long a",
+        "unsigned int b[3]",
+        "enum foo_slot slot",
+        "the same in 1 compile unit",
+    ] {
+        assert!(tree.contains(want), "missing {want:?} in\n{tree}");
+    }
+    let slots = f.stdout(&["SIZED_SLOTS"]);
+    assert!(slots.contains("FOO_D = 11"), "{slots}");
+    let index = f.stdout(&["index"]);
+    assert!(
+        index.contains("type definitions from 1 compile units of vmlinux"),
+        "{index}"
+    );
+    let header = f.tree.join("include/linux/sized.h");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&header)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let stale = f.stdout(&["SIZED_BYTES"]);
+    assert!(conclusion(&stale).contains("sizeof"), "{stale}");
+    assert!(
+        stale.contains("vmlinux is older than linux/include/linux/sized.h"),
+        "{stale}"
+    );
+}

@@ -15,10 +15,12 @@ anstream = "1.0.0"
 anstyle = "1.0.14"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 fst = "0.4.7"
+gimli = { version = "0.34", default-features = false, features = ["read", "std"] }
 globset = "0.4.20"
 libc = "0.2.190"
 memchr = "2.8.3"
 memmap2 = "0.9.11"
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std", "compression"] }
 rayon = "1.12.0"
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 rustc-hash = "2.1.3"

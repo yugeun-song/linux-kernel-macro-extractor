@@ -238,7 +238,9 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = DumpFormat::Tsv)]
         format: DumpFormat,
     },
-    #[command(about = "Rebuild this tree's index from scratch")]
+    #[command(
+        about = "Rebuild this tree's index from scratch and read the C types from the build's DWARF"
+    )]
     Index,
     #[command(about = "List every indexed kernel tree (no TREE needed)")]
     Ls,

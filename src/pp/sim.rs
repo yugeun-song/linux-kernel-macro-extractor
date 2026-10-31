@@ -146,6 +146,7 @@ impl MacroTable {
 struct Frame {
     file: SrcFile,
     found: Option<usize>,
+    from_line: u32,
 }
 
 struct IfState {
@@ -203,6 +204,7 @@ pub struct Sim<'w> {
     once: FxHashSet<SrcFile>,
     guards: FxHashMap<SrcFile, Option<Sym>>,
     visited: FxHashSet<SrcFile>,
+    partial: FxHashMap<SrcFile, u32>,
     stack: Vec<Frame>,
     active_conds: Vec<CondId>,
     counter: u32,
@@ -301,6 +303,7 @@ impl<'w> Sim<'w> {
             once: FxHashSet::default(),
             guards: FxHashMap::default(),
             visited: FxHashSet::default(),
+            partial: FxHashMap::default(),
             stack: Vec::new(),
             active_conds: Vec::new(),
             counter: 0,
@@ -498,14 +501,27 @@ impl<'w> Sim<'w> {
             Some((p, l)) if self.files.entry(f).abs.as_deref() == Some(p.as_path()) => Some(*l),
             _ => None,
         };
-        self.stack.push(Frame { file: f, found });
+        self.stack.push(Frame {
+            file: f,
+            found,
+            from_line: self.cur_line,
+        });
         let mut ifs: Vec<IfState> = Vec::new();
         for (i, d) in dirs.iter().enumerate() {
             if self.stopped {
                 break;
             }
-            if stop_line.is_some_and(|l| d.line >= l) {
+            if let Some(l) = stop_line.filter(|&l| d.line >= l) {
                 self.stopped = true;
+                self.partial.insert(f, l);
+                let frames: Vec<(SrcFile, u32)> = self
+                    .stack
+                    .iter()
+                    .map(|fr| (fr.file, fr.from_line))
+                    .collect();
+                for w in frames.windows(2) {
+                    self.partial.entry(w[0].0).or_insert(w[1].1);
+                }
                 break;
             }
             self.cur_line = d.line;
@@ -881,6 +897,12 @@ impl<'w> Sim<'w> {
 
     pub fn visited(&self, f: SrcFile) -> bool {
         self.visited.contains(&f)
+    }
+
+    pub fn reached(&self, f: SrcFile, line: u32) -> bool {
+        self.visited(f)
+            && self.skip_at(f, line).is_none()
+            && self.partial.get(&f).is_none_or(|&end| line < end)
     }
 
     pub fn macro_names(&self) -> impl Iterator<Item = Sym> + '_ {

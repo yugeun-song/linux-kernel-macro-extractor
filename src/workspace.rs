@@ -46,6 +46,8 @@ pub struct Workspace {
     pub(crate) sources: Sources,
     pub(crate) setups: Mutex<FxHashMap<String, std::sync::Arc<crate::analysis::context::Setup>>>,
     cache_dir: OnceLock<PathBuf>,
+    pub(crate) types: OnceLock<crate::types::Types>,
+    pub quiet: bool,
 }
 
 pub const CACHE_DIR: &str = "cache";
@@ -322,6 +324,8 @@ impl Pending {
             sources: Sources::default(),
             setups: Mutex::new(FxHashMap::default()),
             cache_dir: OnceLock::new(),
+            types: OnceLock::new(),
+            quiet: false,
         }
     }
 

@@ -143,6 +143,7 @@ struct CtxOutcome {
     judged: Vec<Option<Candidate>>,
     def: Option<DefOutcome>,
     extra: Vec<String>,
+    extra_types: Vec<String>,
 }
 
 const AUTO_INCLUDE_ROUNDS: usize = 3;
@@ -192,6 +193,7 @@ struct Job<'a, 'w> {
 #[derive(Default)]
 struct Rounds {
     extra: Vec<String>,
+    extra_types: Vec<String>,
     covers: Option<Vec<PathBuf>>,
     rounds: usize,
     last_batch: usize,
@@ -232,6 +234,8 @@ fn analyze_context<'w>(
         None => st.first_site = Some(key),
         Some(first) if *first != key => {
             st.extra.truncate(st.last_batch);
+            let kept = st.extra.clone();
+            st.extra_types.retain(|h| kept.contains(h));
             st.rounds = AUTO_INCLUDE_ROUNDS;
             return Step::Again;
         }
@@ -245,7 +249,12 @@ fn analyze_context<'w>(
         drop(b);
         let (out, trace, truncated) = sim.expand_text(call, true);
         if job.auto && st.rounds < AUTO_INCLUDE_ROUNDS {
-            let more = candidates::headers_defining_undefined(ws, sim, &out, &ctx.model, &st.extra);
+            let mut more =
+                candidates::headers_defining_undefined(ws, sim, &out, &ctx.model, &st.extra);
+            if more.is_empty() {
+                more = candidates::headers_defining_types(ws, sim, &out, &ctx.model, &st.extra);
+                st.extra_types.extend(more.iter().cloned());
+            }
             if !more.is_empty() {
                 st.last_batch = st.extra.len();
                 st.extra.extend(more);
@@ -253,10 +262,19 @@ fn analyze_context<'w>(
                 return Step::Again;
             }
         }
+        let params = macro_params(&d);
         let conclusion = (!truncated)
-            .then(|| super::c_expr::simplify(&out, &sim.it, &rustc_hash::FxHashSet::default()))
+            .then(|| {
+                let env = super::c_type::TypeCx::new(
+                    ws,
+                    sim,
+                    super::expansion::char_unsigned(ws, &ctx.model),
+                );
+                super::c_expr::simplify(&out, &sim.it, &params, &env)
+            })
             .flatten();
         let mut b = Builder::new(sim, ws, &ctx.model, &opts.tree);
+        b.bind(params.iter().copied());
         let expansion = trace.and_then(|t| b.build(&t).into_iter().next());
         let value = if d.is_function() {
             None
@@ -293,7 +311,22 @@ fn analyze_context<'w>(
         judged,
         def,
         extra: st.extra.clone(),
+        extra_types: st.extra_types.clone(),
     }))
+}
+
+fn macro_params(d: &crate::pp::macros::MacroDef) -> rustc_hash::FxHashSet<crate::intern::Sym> {
+    match &d.params {
+        crate::pp::macros::Params::Function { names, variadic } => {
+            let mut set: rustc_hash::FxHashSet<crate::intern::Sym> =
+                names.iter().copied().collect();
+            if *variadic == crate::pp::macros::Variadic::Anonymous {
+                set.insert(crate::intern::sym::VA_ARGS);
+            }
+            set
+        }
+        _ => rustc_hash::FxHashSet::default(),
+    }
 }
 
 fn run_context(
@@ -807,12 +840,35 @@ fn finish(
             }
             report.expansion = d.expansion;
             report.conclusion = d.conclusion;
+            let unresolved = report
+                .conclusion
+                .as_deref()
+                .is_some_and(|t| t.contains("sizeof") || t.contains("offsetof"));
+            if unresolved && let Some(n) = ws.types_if_loaded().and_then(|t| t.note()) {
+                report.notes.push(n);
+            }
             report.value = report.expansion.as_ref().and_then(|n| n.value.clone());
             report.active = d.site.clone();
-            if !o.extra.is_empty() {
+            let (types, macros): (Vec<&String>, Vec<&String>) =
+                o.extra.iter().partition(|h| o.extra_types.contains(h));
+            if !macros.is_empty() {
                 report.notes.push(format!(
                     "auto-included to define the macros used: {}",
-                    o.extra.join(" ")
+                    macros
+                        .iter()
+                        .map(|h| h.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            if !types.is_empty() {
+                report.notes.push(format!(
+                    "auto-included to define the types used: {}",
+                    types
+                        .iter()
+                        .map(|h| h.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 ));
             }
             report.value.clone()

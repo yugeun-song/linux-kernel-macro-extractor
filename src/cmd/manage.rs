@@ -373,7 +373,28 @@ pub fn describe_block(project: &Project, m: &Manifest) -> String {
 pub fn index(tree: &Path, mut opts: OpenOptions, ctx: &Ctx) -> Result<i32> {
     opts.rebuild = true;
     let mut notify = |m: &str| ctx.notify(m);
-    let ws = Workspace::open(tree, &opts, &mut notify)?;
-    crate::render::print(&describe_block(&ws.project, &ws.manifest));
+    let mut ws = Workspace::open(tree, &opts, &mut notify)?;
+    ws.quiet = ctx.quiet;
+    let mut block = describe_block(&ws.project, &ws.manifest);
+    let types = ws.types();
+    let line = match (&types.table, types.note()) {
+        (Some(t), _) => {
+            let modules = t.meta.products.len().saturating_sub(1);
+            format!(
+                "{} type definitions from {} compile units of vmlinux{}",
+                t.def_count(),
+                t.meta.units,
+                if modules > 0 {
+                    format!(" and {modules} modules")
+                } else {
+                    String::new()
+                }
+            )
+        }
+        (None, Some(note)) => note,
+        (None, None) => "no type information".to_string(),
+    };
+    block.push_str(&format!("  types     {line}\n"));
+    crate::render::print(&block);
     Ok(exit::OK)
 }
