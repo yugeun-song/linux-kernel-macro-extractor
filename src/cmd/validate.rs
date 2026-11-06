@@ -17,6 +17,7 @@ fn command_label(command: &Command) -> &'static str {
         Command::Uses { .. } => "uses",
         Command::Dump { .. } => "dump",
         Command::Index => "index",
+        Command::Refresh => "refresh",
         Command::Ls => "ls",
         Command::Rm { .. } => "rm",
         Command::Prune => "prune",
@@ -40,6 +41,7 @@ pub fn applicable(command: &Command, g: &Global) -> Result<()> {
         Command::Line { .. } => &["--set"],
         Command::List { .. }
         | Command::Index
+        | Command::Refresh
         | Command::Ls
         | Command::Rm { .. }
         | Command::Prune

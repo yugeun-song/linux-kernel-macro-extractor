@@ -521,6 +521,35 @@ fn edits_refresh_the_index() {
 }
 
 #[test]
+fn refresh_keeps_an_index_it_can_update() {
+    let Some(f) = Fixture::new() else { return };
+    assert_eq!(
+        conclusion(&f.stdout(&["FOO_MODE", "--brief"])),
+        "FOO_MODE = 1"
+    );
+    let header = f.tree.join("include/linux/foo.h");
+    let text = std::fs::read_to_string(&header).unwrap();
+    std::fs::write(
+        &header,
+        text.replace("#define FOO_MODE 1", "#define FOO_MODE 3"),
+    )
+    .unwrap();
+    let out = f.kmx(&["refresh"]);
+    assert_eq!(code(&out), 0);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("index updated") && !err.contains("rebuilding"),
+        "{err}"
+    );
+    let out = f.kmx(&["--norefresh", "FOO_MODE", "--brief"]);
+    assert_eq!(code(&out), 0);
+    assert_eq!(
+        conclusion(&String::from_utf8_lossy(&out.stdout)),
+        "FOO_MODE = 3"
+    );
+}
+
+#[test]
 fn moved_heads_and_new_configs_refresh_the_index() {
     let Some(f) = Fixture::new() else { return };
     f.stdout(&["FOO_MODE", "--brief"]);

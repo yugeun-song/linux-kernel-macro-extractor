@@ -362,8 +362,7 @@ pub fn describe_block(project: &Project, m: &Manifest) -> String {
     s
 }
 
-pub fn index(tree: &Path, mut opts: OpenOptions, ctx: &Ctx) -> Result<i32> {
-    opts.rebuild = true;
+pub fn index(tree: &Path, opts: OpenOptions, ctx: &Ctx) -> Result<i32> {
     let mut notify = |m: &str| ctx.notify(m);
     let mut ws = Workspace::open(tree, &opts, &mut notify)?;
     ws.quiet = ctx.quiet;

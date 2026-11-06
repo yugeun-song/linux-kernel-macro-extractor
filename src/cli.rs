@@ -242,6 +242,10 @@ pub enum Command {
         about = "Rebuild this tree's index from scratch and read the C types from the build's DWARF"
     )]
     Index,
+    #[command(
+        about = "Update this tree's index incrementally where that stays right, else rebuild it, and read the C types from the build's DWARF"
+    )]
+    Refresh,
     #[command(about = "List every indexed kernel tree (no TREE needed)")]
     Ls,
     #[command(about = "Delete the index of these kernel trees (no TREE needed)")]
@@ -337,7 +341,7 @@ impl Global {
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "show", "expand", "line", "list", "grep", "uses", "dump", "index", "help",
+    "show", "expand", "line", "list", "grep", "uses", "dump", "index", "refresh", "help",
 ];
 
 fn value_options() -> (Vec<String>, Vec<char>) {

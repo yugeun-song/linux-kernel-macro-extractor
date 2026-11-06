@@ -115,6 +115,11 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Prune => manage::prune(&ctx),
         Command::Inspect { targets } => manage::inspect(targets, g),
         Command::Index => {
+            let (tree, mut opts) = target()?;
+            opts.rebuild = true;
+            manage::index(&tree, opts, &ctx)
+        }
+        Command::Refresh => {
             let (tree, opts) = target()?;
             manage::index(&tree, opts, &ctx)
         }

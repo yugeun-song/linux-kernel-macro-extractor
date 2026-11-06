@@ -271,7 +271,8 @@ kmx rm 2c2efcc13985                           delete one index, by ID prefix or 
 | `grep PATTERN [-w] [-g]` | Print every definition of the matching names, one line each, with its status in this configuration: `path:line: definition  [status]`. PATTERN is a regular expression matched anywhere in a name, as in rg; `-w` matches whole names and `-g` takes a glob. |
 | `uses NAME` | Print the definitions whose body uses NAME, with their status in this configuration. |
 | `dump [--format tsv\|json]` | Dump every macro active in a context. Needs `--in` or `--include`. |
-| `index` | Rebuild this tree's index from scratch and read the C types from the build's DWARF, so that no later query waits for them. Build scripts call it after a kernel build. |
+| `index` | Rebuild this tree's index from scratch and read the C types from the build's DWARF, so that no later query waits for them. |
+| `refresh` | The same, keeping the index when it can be updated: as any query would, incrementally, or with a full rebuild when the change is large or the architecture changed. Build scripts call it after a kernel build. |
 | `ls` | List every indexed tree: ID, kernel, commit, content hash, architecture, state, age, size and path. No `TREE`. |
 | `rm ID\|TREE...` | Delete the index of these trees, named by an ID prefix (from `ls`) or a tree path. No `TREE`. |
 | `prune` | Delete the indexes whose tree or build directory is gone, that are no longer a kernel tree, or that are incomplete. No `TREE`. |
